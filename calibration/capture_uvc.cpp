@@ -58,7 +58,10 @@ int main(int argc, char * argv[])
     int width = yaml["image_width"].as<int>();
     int height = yaml["image_height"].as<int>();
     if (width <= 0 || height <= 0) throw std::runtime_error("Invalid capture resolution");
-    if (!std::getenv("DISPLAY") && !std::getenv("WAYLAND_DISPLAY")) {
+    const char * display = std::getenv("DISPLAY");
+    const char * wayland_display = std::getenv("WAYLAND_DISPLAY");
+    if ((!display || display[0] == '\0') &&
+        (!wayland_display || wayland_display[0] == '\0')) {
       throw std::runtime_error("Capture requires a display; offline calibrate_uvc does not");
     }
     if (output.empty()) {
@@ -137,7 +140,9 @@ int main(int argc, char * argv[])
         {8, 28}, cv::FONT_HERSHEY_SIMPLEX, 0.6, {255, 255, 255}, 1, cv::LINE_AA);
       cv::imshow(window, drawing);
       auto key = cv::waitKey(1) & 0xff;
-      if (key == 'q' || key == 27 || cv::getWindowProperty(window, cv::WND_PROP_VISIBLE) < 1) break;
+      const double window_visible = cv::getWindowProperty(window, cv::WND_PROP_VISIBLE);
+      // 部分 HighGUI 后端不支持可见性属性并返回 -1；只有明确返回 0 才按窗口关闭处理。
+      if (key == 'q' || key == 27 || window_visible == 0.0) break;
       if (key == 's') {
         if (!detect_board) found = calibration::find_corners(image, board, corners);
         if (found) {

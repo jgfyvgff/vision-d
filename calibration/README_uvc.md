@@ -101,3 +101,55 @@ YAML 包含 `camera_model`、原始 `image_width/image_height`、按行展开的
 `uvc_calibration_test` 检查自定义棋盘格检测、空白图拒绝、普通与鱼眼模型的已知参数
 恢复、未见过姿态的投影、逐图与整体 RMS 一致性，以及去畸变映射和样本不足检查。
 测试数据是合成数据，不能替代实机标定精度检查。
+
+## UVC 相机到云台的外参
+
+`capture_uvc_handeye` 与 `calibrate_uvc_handeye` 用于标定左/右鱼眼相机到云台坐标系的
+刚体变换。它们和主摄共用 `R_gimbal2imubody` 的姿态转换，因此两个 UVC 结果也落在同一个
+云台/世界参考系中。每台相机分别采集、分别求解；标定板采集期间固定在场地上，移动云台
+改变相机姿态。程序只接收云台姿态，不发送控制或开火指令。
+
+根目录完整构建后使用以下命令：
+
+```bash
+cmake --build build --target capture_uvc_handeye calibrate_uvc_handeye uvc_calibration_test -j2
+./build/uvc_calibration_test
+```
+
+在有图形桌面的 NUC 上分别采集左右相机。按 `s` 保存一组图像与同一采集时刻插值得到的
+云台四元数，按 `q` 退出；四元数文件使用 `w x y z` 顺序。相机配置取 `sentry.yaml` 中的
+角色和设备，云台姿态外参配置使用与主摄标定相同的 `calibration.yaml`：
+
+```bash
+./build/capture_uvc_handeye --camera=left \
+  --camera-config=configs/sentry.yaml \
+  --gimbal-config=configs/calibration.yaml \
+  --output-folder=assets/uvc_calibration/left/handeye
+./build/capture_uvc_handeye --camera=right \
+  --camera-config=configs/sentry.yaml \
+  --gimbal-config=configs/calibration.yaml \
+  --output-folder=assets/uvc_calibration/right/handeye
+```
+
+每台建议保存 20～30 个不同云台 yaw/pitch 姿态；画面中棋盘格要完整、清晰。不要移动棋盘
+来代替转动云台。采集图像时间来自相机接收线程，程序按该单调时钟时间戳从云台姿态队列
+插值；这不是硬件触发同步，快速运动时仍要考虑相机接收时间与曝光中心的差异。
+
+先对每台相机完成鱼眼内参标定，再把对应 `fisheye.yaml` 和手眼采集目录交给求解器：
+
+```bash
+./build/calibrate_uvc_handeye assets/uvc_calibration/left/handeye \
+  --intrinsics=assets/uvc_calibration/left/results/fisheye.yaml \
+  --gimbal-config=configs/calibration.yaml \
+  --output-file=assets/uvc_calibration/left/camera_to_gimbal.yaml
+./build/calibrate_uvc_handeye assets/uvc_calibration/right/handeye \
+  --intrinsics=assets/uvc_calibration/right/results/fisheye.yaml \
+  --gimbal-config=configs/calibration.yaml \
+  --output-file=assets/uvc_calibration/right/camera_to_gimbal.yaml
+```
+
+鱼眼角点先用 OpenCV 鱼眼模型去畸变为归一化坐标，再通过平面 IPPE 求板姿态，并以原始鱼眼
+投影误差和正深度条件选择分支；外参通过与主摄相同的 `calibrateRobotWorldHandEye` 求解。
+输出的 `R_camera2gimbal` 将相机坐标向量旋转到云台坐标系，`t_camera2gimbal` 是相机原点在
+云台坐标系中的位置，单位 m。结果写入单独文件，不会自动覆盖或修改 `sentry.yaml`；应用前
+还需检查旋转方向、平移符号和多组姿态下的重投影/几何一致性。

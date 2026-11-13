@@ -61,6 +61,9 @@ private:
   double pitch_offset_;
   double comming_angle_;
   double leaving_angle_;
+  // 二次空气阻力系数 k（1/m）与重力加速度（m/s²），与弹道反解使用同一配置。
+  double ballistic_resistance_ = 0.092;
+  double ballistic_gravity_ = 9.7833;
   // 跨帧选板锁只由本帧最终有效的预测结果更新。
   int lock_id_ = -1;
   double decision_speed_;

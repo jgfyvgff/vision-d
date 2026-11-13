@@ -1,4 +1,5 @@
 #include "calibration/uvc_calibration.hpp"
+#include "calibration/uvc_handeye.hpp"
 
 #include <fmt/core.h>
 
@@ -112,12 +113,68 @@ void test_chessboard()
   expect(!calibration::find_corners(blank, board, corners), "Blank image accepted as chessboard");
   fmt::print("PASS configurable chessboard and blank-image rejection\n");
 }
+
+cv::Mat rotation_from_vector(const cv::Vec3d & vector)
+{
+  cv::Mat result;
+  cv::Rodrigues(vector, result);
+  return result;
+}
+
+void test_fisheye_pose_and_handeye()
+{
+  calibration::Chessboard board{{11, 8}, 30, 12};
+  const auto points = calibration::board_points(board);
+  const cv::Mat camera_matrix =
+    (cv::Mat_<double>(3, 3) << 620, 0, 635, 0, 610, 365, 0, 0, 1);
+  const cv::Mat distortion = (cv::Mat_<double>(1, 4) << -0.03, 0.006, -0.001, 0.0002);
+  const cv::Vec3d known_rvec(0.18, -0.24, 0.08);
+  const cv::Vec3d known_tvec(-110, -65, 760);
+  std::vector<cv::Point2f> pixels;
+  cv::fisheye::projectPoints(points, pixels, known_rvec, known_tvec, camera_matrix, distortion);
+  const auto pose = calibration::solve_fisheye_board_pose(points, pixels, camera_matrix, distortion);
+  expect(pose.reprojection_rms_px < 1e-3, "Fish-eye PnP did not recover synthetic pose");
+
+  // 构造多组已知云台姿态和固定棋盘位姿，验证变换方向及平移单位在手眼求解中保持一致。
+  const cv::Mat R_camera2gimbal = rotation_from_vector({0.07, -0.11, 0.04});
+  const cv::Mat R_gimbal2camera = R_camera2gimbal.t();
+  const cv::Mat t_camera2gimbal = (cv::Mat_<double>(3, 1) << 120, -40, 80);
+  const cv::Mat t_gimbal2camera = -R_gimbal2camera * t_camera2gimbal;
+  const cv::Mat R_world2board = rotation_from_vector({0.03, -0.08, 0.02});
+  const cv::Mat t_world2board = (cv::Mat_<double>(3, 1) << 220, -120, 0);
+  std::vector<cv::Mat> rvecs_board2camera, tvecs_board2camera;
+  std::vector<cv::Mat> rotations_world2gimbal, translations_world2gimbal;
+  for (int i = 0; i < 18; ++i) {
+    const cv::Mat R_world2gimbal = rotation_from_vector(
+      {0.22 * std::sin(0.7 * i), 0.19 * std::cos(0.43 * i), 0.27 * std::sin(0.31 * i)});
+    const cv::Mat R_board2camera = R_gimbal2camera * R_world2gimbal * R_world2board;
+    const cv::Mat t_board2camera =
+      t_gimbal2camera + R_gimbal2camera * R_world2gimbal * t_world2board;
+    cv::Mat rvec;
+    cv::Rodrigues(R_board2camera, rvec);
+    rvecs_board2camera.push_back(rvec);
+    tvecs_board2camera.push_back(t_board2camera);
+    rotations_world2gimbal.push_back(R_world2gimbal);
+    translations_world2gimbal.push_back(cv::Mat::zeros(3, 1, CV_64F));
+  }
+  const auto handeye = calibration::solve_camera_to_gimbal(
+    rvecs_board2camera, tvecs_board2camera, rotations_world2gimbal,
+    translations_world2gimbal);
+  expect(
+    cv::norm(handeye.rotation_camera_to_gimbal, R_camera2gimbal, cv::NORM_INF) < 1e-5,
+    "Hand-eye rotation direction or estimate is incorrect");
+  expect(
+    cv::norm(handeye.translation_camera_to_gimbal, t_camera2gimbal, cv::NORM_INF) < 1e-3,
+    "Hand-eye translation or units are incorrect");
+  fmt::print("PASS fisheye PnP and synthetic camera-to-gimbal hand-eye\n");
+}
 }  // namespace
 
 int main()
 {
   try {
     test_chessboard();
+    test_fisheye_pose_and_handeye();
     test_model("pinhole");
     test_model("fisheye");
     return 0;

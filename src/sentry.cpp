@@ -73,12 +73,13 @@ int main(int argc, char * argv[])
     Eigen::Vector3d gimbal_pos = tools::eulers(solver.R_gimbal2world(), 2, 1, 0);
 
     auto armors = yolo.detect(img);
+    auto lightbars = yolo.detect_lightbars(img);
 
     decider.armor_filter(armors);
 
     decider.set_priority(armors);
 
-    auto targets = tracker.track(armors, timestamp);
+    auto targets = tracker.track(armors, lightbars, timestamp);
 
     io::Command command{false, false, 0, 0};
 

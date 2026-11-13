@@ -133,7 +133,10 @@ int main(int argc, char * argv[])
       data["vy"] = x[3];
       data["z"] = x[4];
       data["vz"] = x[5];
-      data["a"] = x[6] * 57.3;
+      const auto center_ypr = target.center_ypr();
+      data["a"] = center_ypr[0] * 57.3;
+      data["center_pitch"] = center_ypr[1] * 57.3;
+      data["center_roll"] = center_ypr[2] * 57.3;
       data["w"] = x[7];
       data["r"] = x[8];
       data["l"] = x[9];
@@ -145,6 +148,13 @@ int main(int argc, char * argv[])
       data["residual_pitch"] = target.ekf().data.at("residual_pitch");
       data["residual_distance"] = target.ekf().data.at("residual_distance");
       data["residual_angle"] = target.ekf().data.at("residual_angle");
+      data["residual_armor_roll"] = target.ekf().data.at("residual_armor_roll");
+      data["residual_armor_pitch"] = target.ekf().data.at("residual_armor_pitch");
+      data["residual_armor_yaw"] = target.ekf().data.at("residual_armor_yaw");
+      data["residual_uvl_angle"] = target.ekf().data.at("residual_uvl_angle");
+      data["residual_uvl_center_u"] = target.ekf().data.at("residual_uvl_center_u");
+      data["residual_uvl_center_v"] = target.ekf().data.at("residual_uvl_center_v");
+      data["residual_uvl_length"] = target.ekf().data.at("residual_uvl_length");
       data["nis"] = target.ekf().data.at("nis");
       data["nees"] = target.ekf().data.at("nees");
       data["nis_fail"] = target.ekf().data.at("nis_fail");

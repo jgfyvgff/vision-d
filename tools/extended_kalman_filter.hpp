@@ -5,9 +5,21 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <vector>
 
 namespace tools
 {
+// 一项非线性误差状态观测；观测维度可变，残差约定为 z - h(x)。
+struct ErrorStateObservation
+{
+  Eigen::VectorXd z;
+  Eigen::MatrixXd R;
+  std::function<Eigen::VectorXd(const Eigen::VectorXd &)> predict;
+  std::function<Eigen::VectorXd(const Eigen::VectorXd &, const Eigen::VectorXd &)>
+    residual;
+  std::function<Eigen::MatrixXd(const Eigen::VectorXd &)> jacobian;
+};
+
 class ExtendedKalmanFilter
 {
 public:
@@ -33,6 +45,10 @@ public:
     std::function<Eigen::VectorXd(const Eigen::VectorXd &, const Eigen::VectorXd &)> z_subtract =
       [](const Eigen::VectorXd & a, const Eigen::VectorXd & b) { return a - b; },
     const Eigen::MatrixXd * nis_measurement_noise = nullptr);
+
+  // 固定先验协方差，在每轮重新线性化多项观测后迭代误差增量，末尾统一注入状态。
+  Eigen::VectorXd update_iterated_multi(
+    const std::vector<ErrorStateObservation> & observations, int iteration_num);
 
   Eigen::VectorXd update(
     const Eigen::VectorXd & z, const Eigen::MatrixXd & H, const Eigen::MatrixXd & R,

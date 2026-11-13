@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <list>
 #include <optional>
+#include <string>
 
 #include "tasks/auto_aim/target.hpp"
 #include "tinympc/tiny_api.hpp"
@@ -142,6 +143,11 @@ private:
   double yaw_offset_;
   double pitch_offset_;
   double fire_thresh_;
+  // 二次空气阻力系数 k（1/m）与重力加速度（m/s²）。
+  double ballistic_resistance_ = 0.092;
+  double ballistic_gravity_ = 9.7833;
+  double switch_max_yaw_acc_ = 50.0;
+  double switch_max_pitch_acc_ = 100.0;
   double gimbal_response_delay_ms_ = 0.0;
   double preview_max_advance_rad_ = 0.0;
   double preview_advance_rate_rad_s_ = 0.0;

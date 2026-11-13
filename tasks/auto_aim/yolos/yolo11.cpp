@@ -53,6 +53,11 @@ YOLO11::YOLO11(const std::string & config_path, bool debug)
     model, device_, ov::hint::performance_mode(ov::hint::PerformanceMode::LATENCY));
 }
 
+std::list<Lightbar> YOLO11::detect_lightbars(const cv::Mat & bgr_img)
+{
+  return detector_.detect_lightbars(bgr_img);
+}
+
 std::list<Armor> YOLO11::detect(const cv::Mat & raw_img, int frame_count)
 {
   if (raw_img.empty()) {

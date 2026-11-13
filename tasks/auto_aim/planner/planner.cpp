@@ -15,12 +15,197 @@ using namespace std::chrono_literals;
 
 namespace auto_aim
 {
+namespace
+{
+// 每个换板段匹配两端位置、速度和加速度，使参考曲线在过渡处保持 C² 连续。
+struct QuinticSegment
+{
+  std::array<double, 6> coefficient{};
+  double duration = 0.0;
+
+  double position(double time) const
+  {
+    const double normalized_time = time / duration;
+    return coefficient[0] + normalized_time * (coefficient[1] + normalized_time *
+      (coefficient[2] + normalized_time * (coefficient[3] + normalized_time *
+        (coefficient[4] + normalized_time * coefficient[5]))));
+  }
+
+  double velocity(double time) const
+  {
+    const double normalized_time = time / duration;
+    return (coefficient[1] + normalized_time * (2.0 * coefficient[2] + normalized_time *
+      (3.0 * coefficient[3] + normalized_time * (4.0 * coefficient[4] +
+        normalized_time * 5.0 * coefficient[5])))) / duration;
+  }
+
+  double acceleration(double time) const
+  {
+    const double normalized_time = time / duration;
+    return (2.0 * coefficient[2] + normalized_time * (6.0 * coefficient[3] + normalized_time *
+      (12.0 * coefficient[4] + normalized_time * 20.0 * coefficient[5]))) /
+      (duration * duration);
+  }
+
+  double peak_absolute_acceleration(double duration) const
+  {
+    // 加速度极值只可能出现在区间端点或 jerk=0 的内部根上。
+    std::array<double, 4> candidates{0.0, 1.0, 0.0, 0.0};
+    std::size_t count = 2;
+    const double a = 60.0 * coefficient[5];
+    const double b = 24.0 * coefficient[4];
+    const double c = 6.0 * coefficient[3];
+    if (std::abs(a) < 1e-12) {
+      if (std::abs(b) >= 1e-12) {
+        const double root = -c / b;
+        if (root > 0.0 && root < 1.0) candidates[count++] = root;
+      }
+    } else {
+      const double discriminant = b * b - 4.0 * a * c;
+      if (discriminant >= 0.0) {
+        const double root = std::sqrt(discriminant);
+        const double first = (-b - root) / (2.0 * a);
+        const double second = (-b + root) / (2.0 * a);
+        if (first > 0.0 && first < 1.0) candidates[count++] = first;
+        if (second > 0.0 && second < 1.0) candidates[count++] = second;
+      }
+    }
+    double peak = 0.0;
+    for (std::size_t index = 0; index < count; ++index) {
+      peak = std::max(peak, std::abs(acceleration(candidates[index] * duration)));
+    }
+    return peak;
+  }
+};
+
+QuinticSegment make_quintic(
+  double position_start, double velocity_start, double acceleration_start,
+  double position_end, double velocity_end, double acceleration_end, double duration)
+{
+  QuinticSegment segment;
+  segment.coefficient[0] = position_start;
+  segment.duration = duration;
+  // 归一化到 [0,1] 求多项式，避免 5 ms 短区间的 T⁵ 系数让边界方程病态。
+  segment.coefficient[1] = velocity_start * duration;
+  segment.coefficient[2] = 0.5 * acceleration_start * duration * duration;
+  const double t2 = duration * duration;
+  Eigen::Matrix3d matrix;
+  matrix << 1.0, 1.0, 1.0,
+    3.0, 4.0, 5.0,
+    6.0, 12.0, 20.0;
+  Eigen::Vector3d rhs;
+  rhs << position_end - segment.coefficient[0] - segment.coefficient[1] -
+      segment.coefficient[2],
+    velocity_end * duration - segment.coefficient[1] - 2.0 * segment.coefficient[2],
+    acceleration_end * t2 - 2.0 * segment.coefficient[2];
+  const Eigen::Vector3d tail = matrix.fullPivLu().solve(rhs);
+  segment.coefficient[3] = tail[0];
+  segment.coefficient[4] = tail[1];
+  segment.coefficient[5] = tail[2];
+  return segment;
+}
+
+void smooth_switch_axis(
+  Trajectory & trajectory, int position_row, int velocity_row,
+  const std::array<int, HORIZON> & armor_ids, double max_acceleration)
+{
+  std::vector<int> boundaries;
+  for (int index = 1; index < HORIZON; ++index) {
+    if (armor_ids[index] >= 0 && armor_ids[index - 1] >= 0 &&
+        armor_ids[index] != armor_ids[index - 1]) {
+      boundaries.push_back(index);
+    }
+  }
+
+  for (std::size_t switch_index = 0; switch_index < boundaries.size(); ++switch_index) {
+    const int boundary = boundaries[switch_index];
+    const int left_segment_start =
+      switch_index == 0 ? 0 : boundaries[switch_index - 1];
+    const int right_segment_end = switch_index + 1 == boundaries.size()
+      ? HORIZON - 1 : boundaries[switch_index + 1] - 1;
+    const int left_limit = (left_segment_start + boundary - 1) / 2;
+    const int right_limit = (boundary + right_segment_end) / 2;
+    const int max_radius = std::max(boundary - 1 - left_limit, right_limit - boundary);
+    std::optional<QuinticSegment> selected;
+    int selected_left = boundary - 1;
+    int selected_right = boundary;
+    double radius = std::numeric_limits<double>::infinity();
+
+    // 从切换两侧各一个采样点开始扩展，且不越过相邻切换段的中点。
+    for (int sample_radius = 0; sample_radius <= max_radius; ++sample_radius) {
+      const int left = std::max(left_limit, boundary - 1 - sample_radius);
+      const int right = std::min(right_limit, boundary + sample_radius);
+      if (right <= left) continue;
+      const double duration = (right - left) * DT;
+      double acceleration_start = 0.0;
+      double acceleration_end = 0.0;
+      if (left > left_limit) {
+        acceleration_start =
+          (trajectory(velocity_row, left) - trajectory(velocity_row, left - 1)) / DT;
+      } else if (left + 1 < boundary) {
+        acceleration_start =
+          (trajectory(velocity_row, left + 1) - trajectory(velocity_row, left)) / DT;
+      }
+      if (right < right_limit) {
+        acceleration_end =
+          (trajectory(velocity_row, right + 1) - trajectory(velocity_row, right)) / DT;
+      } else if (right - 1 >= boundary) {
+        acceleration_end =
+          (trajectory(velocity_row, right) - trajectory(velocity_row, right - 1)) / DT;
+      }
+      const auto candidate = make_quintic(
+        trajectory(position_row, left), trajectory(velocity_row, left), acceleration_start,
+        trajectory(position_row, right), trajectory(velocity_row, right), acceleration_end,
+        duration);
+      const double peak = candidate.peak_absolute_acceleration(duration);
+      selected = candidate;
+      selected_left = left;
+      selected_right = right;
+      radius = peak;
+      if (peak <= max_acceleration) break;
+    }
+
+    if (!selected || !std::isfinite(radius)) continue;
+    const double duration = (selected_right - selected_left) * DT;
+    for (int index = selected_left; index <= selected_right; ++index) {
+      const double time = (index - selected_left) * DT;
+      trajectory(position_row, index) = selected->position(time);
+      trajectory(velocity_row, index) = selected->velocity(time);
+    }
+  }
+}
+
+void smooth_switches(
+  Trajectory & trajectory, const std::array<int, HORIZON> & armor_ids,
+  double max_yaw_acceleration, double max_pitch_acceleration)
+{
+  smooth_switch_axis(trajectory, 0, 1, armor_ids, max_yaw_acceleration);
+  smooth_switch_axis(trajectory, 2, 3, armor_ids, max_pitch_acceleration);
+}
+}  // namespace
+
 Planner::Planner(const std::string & config_path)
 {
   auto yaml = tools::load(config_path);
   yaw_offset_ = tools::read<double>(yaml, "yaw_offset") / 57.3;
   pitch_offset_ = tools::read<double>(yaml, "pitch_offset") / 57.3;
   fire_thresh_ = tools::read<double>(yaml, "fire_thresh");
+  ballistic_resistance_ = yaml["ballistic_resistance"].IsDefined()
+                            ? yaml["ballistic_resistance"].as<double>()
+                            : 0.092;
+  ballistic_gravity_ = yaml["ballistic_gravity"].IsDefined()
+                         ? yaml["ballistic_gravity"].as<double>()
+                         : 9.7833;
+  if (!std::isfinite(ballistic_resistance_) || ballistic_resistance_ < 0.0 ||
+      !std::isfinite(ballistic_gravity_) || ballistic_gravity_ <= 0.0) {
+    throw std::invalid_argument("invalid ballistic resistance or gravity configuration");
+  }
+  switch_max_yaw_acc_ = tools::read<double>(yaml, "max_yaw_acc");
+  switch_max_pitch_acc_ = tools::read<double>(yaml, "max_pitch_acc");
+  if (!std::isfinite(switch_max_yaw_acc_) || switch_max_yaw_acc_ <= 0.0 ||
+      !std::isfinite(switch_max_pitch_acc_) || switch_max_pitch_acc_ <= 0.0) {
+    throw std::invalid_argument("planner switch smoothing requires positive axis acceleration limits");
+  }
   if (yaml["planner_gimbal_response_delay_ms"].IsDefined()) {
     set_gimbal_response_delay_ms(
       yaml["planner_gimbal_response_delay_ms"].as<double>());
@@ -182,7 +367,8 @@ Plan Planner::plan(Target target, double bullet_speed)
       xyz = xyza.head<3>();
     }
   }
-  auto bullet_traj = tools::Trajectory(bullet_speed, min_dist, xyz.z());
+  auto bullet_traj = tools::Trajectory(
+    bullet_speed, min_dist, xyz.z(), ballistic_resistance_, ballistic_gravity_);
   target.predict(bullet_traj.fly_time);
 
   // 2. Get trajectory
@@ -258,7 +444,8 @@ Plan Planner::plan_centered_diagnostic(
   try {
     const auto & xyz = armors[armor_id];
     const double distance = xyz.head<2>().norm();
-    const tools::Trajectory flight(bullet_speed, distance, xyz.z());
+    const tools::Trajectory flight(
+      bullet_speed, distance, xyz.z(), ballistic_resistance_, ballistic_gravity_);
     if (flight.unsolvable || !std::isfinite(flight.fly_time)) return {false};
     target.predict(flight.fly_time);
 
@@ -399,7 +586,8 @@ Plan Planner::plan(
       nearest_xyz = xyza.head<3>();
     }
   }
-  const auto flight = tools::Trajectory(bullet_speed, min_dist, nearest_xyz.z());
+  const auto flight = tools::Trajectory(
+    bullet_speed, min_dist, nearest_xyz.z(), ballistic_resistance_, ballistic_gravity_);
   if (flight.unsolvable || !std::isfinite(flight.fly_time)) return {false};
   target.predict(flight.fly_time);
   fire_target.predict(flight.fly_time);
@@ -414,11 +602,14 @@ Plan Planner::plan(
     const double yaw0 = aim(target, bullet_speed, armor_id)(0);
     int preview_switch_step = -1;
     int preview_switch_id = -1;
+    std::array<int, HORIZON> local_preview_armor_ids{};
+    auto * preview_ids = reference_mode
+      ? (switch_preview ? &switch_preview->armor_id : &local_preview_armor_ids)
+      : nullptr;
     const auto traj = get_trajectory(
       target, yaw0, bullet_speed, true, armor_id,
       reference_mode ? preview_aimer : nullptr, &preview_switch_step,
-      &preview_switch_id,
-      switch_preview && reference_mode ? &switch_preview->armor_id : nullptr);
+      &preview_switch_id, preview_ids);
     if (!std::isfinite(yaw0) || !traj.allFinite()) return {false};
     if (switch_preview && reference_mode) {
       switch_preview->valid = true;
@@ -600,7 +791,8 @@ Eigen::Matrix<double, 2, 1> Planner::aim(
   debug_xyza = Eigen::Vector4d(xyz.x(), xyz.y(), xyz.z(), yaw);
 
   auto azim = std::atan2(xyz.y(), xyz.x());
-  auto bullet_traj = tools::Trajectory(bullet_speed, min_dist, xyz.z());
+  auto bullet_traj = tools::Trajectory(
+    bullet_speed, min_dist, xyz.z(), ballistic_resistance_, ballistic_gravity_);
   if (bullet_traj.unsolvable) throw std::runtime_error("Unsolvable bullet trajectory!");
 
   return {tools::limit_rad(azim + yaw_offset_), -bullet_traj.pitch - pitch_offset_};
@@ -617,11 +809,11 @@ Trajectory Planner::get_trajectory(
   std::optional<int> selected_id = armor_id;
 
   target.predict(-DT * (start_at_now ? 1 : HALF_HORIZON + 1));
-  auto yaw_pitch_last = aim(target, bullet_speed, selected_id);
-
   // 旧入口第 50 列对应当前时刻；实测初态入口第 0 列对应当前时刻。
   target.predict(DT);
   auto yaw_pitch = aim(target, bullet_speed, selected_id);
+  double previous_yaw_reference = 0.0;
+  bool have_previous_yaw_reference = false;
 
   for (int i = 0; i < HORIZON; i++) {
     target.predict(DT);
@@ -634,18 +826,30 @@ Trajectory Planner::get_trajectory(
         if (preview_switch_id && next_id) *preview_switch_id = *next_id;
       }
     }
-    auto yaw_pitch_next = aim(target, bullet_speed, next_id);
-
-    auto yaw_vel = tools::limit_rad(yaw_pitch_next(0) - yaw_pitch_last(0)) / (2 * DT);
-    auto pitch_vel = (yaw_pitch_next(1) - yaw_pitch_last(1)) / (2 * DT);
-
-    traj.col(i) << tools::limit_rad(yaw_pitch(0) - yaw0), yaw_vel, yaw_pitch(1), pitch_vel;
+    // 先沿当前板估计本地斜率，避免把换板角度阶跃误当成瞬时目标速度。
+    const auto same_armor_next = aim(target, bullet_speed, selected_id);
+    const auto yaw_pitch_next = aim(target, bullet_speed, next_id);
+    const double yaw_velocity =
+      tools::limit_rad(same_armor_next(0) - yaw_pitch(0)) / DT;
+    const double pitch_velocity = (same_armor_next(1) - yaw_pitch(1)) / DT;
+    double yaw_reference = tools::limit_rad(yaw_pitch(0) - yaw0);
+    if (have_previous_yaw_reference) {
+      yaw_reference = previous_yaw_reference +
+        tools::limit_rad(yaw_reference - previous_yaw_reference);
+    }
+    traj.col(i) << yaw_reference, yaw_velocity, yaw_pitch(1), pitch_velocity;
+    previous_yaw_reference = yaw_reference;
+    have_previous_yaw_reference = true;
     // 本列仍属于 selected_id；next_id 从下一列才生效。
     if (preview_armor_ids) (*preview_armor_ids)[i] = selected_id.value_or(-1);
 
-    yaw_pitch_last = yaw_pitch;
     yaw_pitch = yaw_pitch_next;
     selected_id = next_id;
+  }
+
+  if (preview_armor_ids != nullptr) {
+    smooth_switches(
+      traj, *preview_armor_ids, switch_max_yaw_acc_, switch_max_pitch_acc_);
   }
 
   return traj;

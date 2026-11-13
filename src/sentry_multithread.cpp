@@ -19,6 +19,7 @@
 #endif
 #include "io/usbcamera/usbcamera.hpp"
 #include "tasks/auto_aim/aimer.hpp"
+#include "tasks/auto_aim/planner/planner.hpp"
 #include "tasks/auto_aim/shooter.hpp"
 #include "tasks/auto_aim/solver.hpp"
 #include "tasks/auto_aim/tracker.hpp"
@@ -204,6 +205,7 @@ int main(int argc, char * argv[])
   auto_aim::Solver solver(config_path);
   auto_aim::Tracker tracker(config_path, solver);
   auto_aim::Aimer aimer(config_path);
+  auto_aim::Planner planner(config_path);
   auto_aim::Shooter shooter(config_path);
 
   omniperception::Decider decider(config_path);
@@ -309,6 +311,13 @@ int main(int argc, char * argv[])
     // ==================================================
 
     io::Command command{false, false, 0, 0};
+    double command_yaw_vel = 0.0;
+    double command_yaw_acc = 0.0;
+    double command_pitch_vel = 0.0;
+    double command_pitch_acc = 0.0;
+    bool planner_fire_allowed = false;
+    const bool planner_fire_gate_required =
+      current_state != "switching" && current_state != "lost";
 
     /// 全向感知逻辑
     if (locked_turn) {
@@ -347,16 +356,63 @@ int main(int argc, char * argv[])
         command.shoot = false;
         command.yaw = gimbal_pos[0];
         command.pitch = gimbal_pos[1];  // 保持当前俯仰，避免 pitch 归零
+        planner.reset_tx_yaw();
       } else if (current_state == "lost") {
         command = decider.decide(detection_queue);
         command.yaw = tools::limit_rad(command.yaw + gimbal_pos[0]);
+        planner.reset_tx_yaw();
       } else {
-        command = aimer.aim(targets, timestamp, gimbal.state().bullet_speed);
+        const auto feedback = gimbal.state();
+        command = aimer.aim_with_explicit_speed(
+          targets, timestamp, feedback.bullet_speed);
+        if (!targets.empty() && command.control && aimer.debug_aim_point.valid &&
+            aimer.debug_aim_point.armor_id >= 0) {
+          auto target = targets.front();
+          const auto planning_time = std::chrono::steady_clock::now();
+          target.predict(planning_time);
+          const auto plan = planner.plan(
+            target, feedback.bullet_speed,
+            auto_aim::PlannerState{
+              feedback.yaw, feedback.yaw_vel, feedback.pitch, feedback.pitch_vel},
+            aimer.debug_aim_point.armor_id, &aimer);
+          auto command_plan = plan;
+          if (command_plan.diagnostic_valid) {
+            planner.prepare_tx_yaw(
+              command_plan, tracker.target_generation(), aimer.debug_aim_point.armor_id,
+              std::chrono::steady_clock::now());
+          }
+          if (command_plan.diagnostic_valid && command_plan.tx_yaw_valid) {
+            command.control = true;
+            command.yaw = command_plan.tx_yaw;
+            command.pitch = command_plan.control
+              ? command_plan.pitch + auto_aim::DT * command_plan.pitch_vel
+              : command_plan.command_target_pitch;
+            planner_fire_allowed = command_plan.control && command_plan.fire;
+            if (command_plan.control) {
+              command_yaw_vel = command_plan.yaw_vel;
+              command_yaw_acc = command_plan.yaw_acc;
+              command_pitch_vel = command_plan.pitch_vel;
+              command_pitch_acc = command_plan.pitch_acc;
+            } else {
+              command_yaw_vel = command_plan.command_target_yaw_vel;
+            }
+          } else {
+            command = {false, false, feedback.yaw, feedback.pitch};
+            planner.reset_tx_yaw();
+          }
+        } else {
+          command = {false, false, feedback.yaw, feedback.pitch};
+          planner.reset_tx_yaw();
+        }
       }
     }
 
     /// 发射逻辑
-    command.shoot = shooter.shoot(command, aimer, targets, gimbal_pos);
+    const bool shooter_allows_fire = shooter.shoot(command, aimer, targets, gimbal_pos);
+    command.shoot = shooter_allows_fire &&
+      (planner_fire_gate_required
+         ? planner_fire_allowed
+         : (!locked_turn && current_state != "switching"));
     // command.shoot = false;
 
     /// 距离限制：目标水平距离超过 max_shoot_distance 时不开火
@@ -403,8 +459,11 @@ int main(int argc, char * argv[])
 
     if (gimbal_command_enabled) {
       // ========== 锁定转向期间传计算出的角速度，而非 0 ==========
-      double yaw_vel = locked_turn ? locked_yaw_vel : 0.0;
-      gimbal.send(command.control, command.shoot, command.yaw, yaw_vel, 0, command.pitch, 0, 0);
+      const double yaw_vel = locked_turn ? locked_yaw_vel : command_yaw_vel;
+      gimbal.send(
+        command.control, command.shoot, command.yaw, yaw_vel,
+        locked_turn ? 0.0 : command_yaw_acc, command.pitch,
+        command_pitch_vel, command_pitch_acc);
       // ==================================================
     }
 
@@ -478,7 +537,10 @@ int main(int argc, char * argv[])
         data["vy"] = x[3];
         data["z"] = x[4];
         data["vz"] = x[5];
-        data["a"] = x[6] * 57.3;
+        const auto center_ypr = target.center_ypr();
+        data["a"] = center_ypr[0] * 57.3;
+        data["center_pitch"] = center_ypr[1] * 57.3;
+        data["center_roll"] = center_ypr[2] * 57.3;
         data["w"] = x[7];
         data["r"] = x[8];
         data["l"] = x[9];
@@ -488,6 +550,13 @@ int main(int argc, char * argv[])
         data["residual_pitch"] = target.ekf().data.at("residual_pitch");
         data["residual_distance"] = target.ekf().data.at("residual_distance");
         data["residual_angle"] = target.ekf().data.at("residual_angle");
+        data["residual_armor_roll"] = target.ekf().data.at("residual_armor_roll");
+        data["residual_armor_pitch"] = target.ekf().data.at("residual_armor_pitch");
+        data["residual_armor_yaw"] = target.ekf().data.at("residual_armor_yaw");
+        data["residual_uvl_angle"] = target.ekf().data.at("residual_uvl_angle");
+        data["residual_uvl_center_u"] = target.ekf().data.at("residual_uvl_center_u");
+        data["residual_uvl_center_v"] = target.ekf().data.at("residual_uvl_center_v");
+        data["residual_uvl_length"] = target.ekf().data.at("residual_uvl_length");
         data["nis"] = target.ekf().data.at("nis");
         data["nees"] = target.ekf().data.at("nees");
         data["nis_fail"] = target.ekf().data.at("nis_fail");

@@ -54,6 +54,11 @@ YOLOV5::YOLOV5(const std::string & config_path, bool debug)
     model, device_, ov::hint::performance_mode(ov::hint::PerformanceMode::LATENCY));
 }
 
+std::list<Lightbar> YOLOV5::detect_lightbars(const cv::Mat & bgr_img)
+{
+  return detector_.detect_lightbars(bgr_img);
+}
+
 std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
 {
   if (raw_img.empty()) {

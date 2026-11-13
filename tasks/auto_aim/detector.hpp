@@ -19,6 +19,9 @@ public:
 
   std::list<Armor> detect(const cv::Mat & bgr_img, int frame_count = -1);
 
+  // 独立提取符合灯条几何条件的像素端点，供已有目标做单灯条关联更新。
+  std::list<Lightbar> detect_lightbars(const cv::Mat & bgr_img) const;
+
   bool detect(Armor & armor, const cv::Mat & bgr_img);
 
   friend class YOLOV8;
@@ -36,6 +39,7 @@ private:
   double max_rectangular_error_;
 
   bool debug_;
+  bool single_lightbar_detection_enabled_;
   std::string save_path_;
 
   // 利用PCA回归角点，参考自https://github.com/CSU-FYT-Vision/FYT2024_vision

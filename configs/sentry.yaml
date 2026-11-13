@@ -3,7 +3,7 @@ enemy_color: "blue"
 
 
 #####-----神经网络参数-----#####
-yolo_name: yolov5
+yolo_name: yolov8
 classify_model: assets/tiny_resnet.onnx
 yolo11_model_path: assets/yolo11.xml
 yolov8_model_path: assets/yolov8.xml
@@ -24,7 +24,7 @@ use_roi: false
 #####-----USB相机参数-----#####
 image_width: 1280
 image_height: 720
-usb_frame_rate: 60
+usb_frame_rate: 30
 usb_exposure: 40 # V4L2绝对曝光单位100us，即4ms；长曝光会限制可达到的帧率
 usb_gamma: 160
 usb_gain: 10 #0-96
@@ -50,8 +50,8 @@ cameras:
     pitch_offset_deg: 0
     fov_h_deg: 129.9
     fov_v_deg: 73.1
-    frame_rate_fps: 60 # 请求帧率，单位帧/秒
-    usb_exposure: 40 # 100us单位，即4ms
+    frame_rate_fps: 30 # 请求帧率，单位帧/秒
+    usb_exposure: 50 # 100us单位，即4ms
     usb_gain: 10 # UVC设备控件刻度
     usb_gamma: 160 # UVC设备控件刻度
 
@@ -62,8 +62,8 @@ cameras:
     pitch_offset_deg: 0
     fov_h_deg: 129.9
     fov_v_deg: 73.1
-    frame_rate_fps: 60 # 请求帧率，单位帧/秒
-    usb_exposure: 40 # 100us单位，即4ms
+    frame_rate_fps: 30 # 请求帧率，单位帧/秒
+    usb_exposure: 50 # 100us单位，即4ms
     usb_gain: 10 # UVC设备控件刻度
     usb_gamma: 160 # UVC设备控件刻度
 
@@ -86,19 +86,21 @@ gimbal_command_enabled: false # 仅接收下位机状态，不发送云台或发
 min_detect_count: 5
 max_temp_lost_count: 25
 outpost_max_temp_lost_count: 75
+candidate_target_separation_m: 0.65 # m，候选目标必须与主目标预测装甲板保持的最小距离
 
-# Tracker/EKF 参数。P0 对角线顺序：[x,vx,y,vy,z,vz,中心yaw,角速度,r,l,h]。
-# 方差单位依次为 m²、(m/s)²、m²、(m/s)²、m²、(m/s)²、rad²、(rad/s)²、m²、m²、m²。
+# Tracker/EKF 参数。P0 对角线顺序：[x,vx,y,vy,z,vz,rot_z,角速度,r,l,h,rot_y,rot_x]。
+# 平移、半径和高度方差单位为 m² 或 (m/s)²；SO(3)姿态与角速度方差单位为 rad² 或 (rad/s)²。
 balance_radius: 0.2 # m，哨兵旧版双装甲目标半径
 outpost_radius: 0.2765 # m
 base_radius: 0.3205 # m
 standard_radius: 0.2 # m
-balance_initial_covariance_diagonal: [1, 64, 1, 64, 1, 64, 0.4, 100, 1, 1, 1]
-outpost_initial_covariance_diagonal: [1, 64, 1, 64, 1, 81, 0.4, 100, 1e-4, 0, 0]
-base_initial_covariance_diagonal: [1, 64, 1, 64, 1, 64, 0.4, 100, 1e-4, 0, 0]
+balance_initial_covariance_diagonal: [1, 64, 1, 64, 1, 64, 0.4, 100, 1, 1, 1, 0.25, 0.25]
+outpost_initial_covariance_diagonal: [1, 64, 1, 64, 1, 81, 0.4, 100, 1e-4, 0, 0, 0.25, 0.25]
+base_initial_covariance_diagonal: [1, 64, 1, 64, 1, 64, 0.4, 100, 1e-4, 0, 0, 0.25, 0.25]
 standard_initial_position_variance: 1.0 # m²
 standard_initial_velocity_variance: 64.0 # (m/s)²
 standard_initial_center_yaw_variance: 0.4 # rad²
+standard_initial_tilt_variance: 0.25 # rad²，roll/pitch 初始 SO(3) 局部误差方差
 standard_initial_angular_velocity_variance: 100.0 # (rad/s)²
 standard_radius_variance: 1.0 # m²
 standard_radius_delta_variance: 1.0 # m²
@@ -114,15 +116,33 @@ outpost_translation_acceleration_variance: 10.0 # m²/s⁴
 outpost_angular_acceleration_variance: 0.1 # rad²/s⁴
 base_translation_acceleration_variance: 100.0 # m²/s⁴
 base_angular_acceleration_variance: 400.0 # rad²/s⁴
+# AWAKENING 风格整车 UVL 观测；设为 pnp_ypd 可在离线回放中对照旧更新。
+tracker_observation_model: uvl
+esekf_iter_num: 5
+qxyz_common: [3.0, 3.0, 0.1] # 车体系平移加速度噪声方差
+qyaw_common: 30.0 # rad²/s⁴
+qxyz_output: [1.0, 1.0, 1.0] # 前哨站车体系平移加速度噪声方差
+qyaw_output: 0.01 # rad²/s⁴
+q_r: 0.0000001
+q_h: 0.0000001
+q_wpr: 0.01 # rad²/s，roll/pitch 随机游走
+r_sigma_angle: 0.1 # rad
+r_sigma_px_by_length_ratio: 0.2
+r_sigma_length_by_length_ratio: 0.3
+single_lightbar_update_enabled: true
+single_lightbar_length_ratio_gate: 0.2 # 相对预测灯条长度的误差比例
+single_lightbar_angle_gate_rad: 0.2 # rad
+single_lightbar_position_ratio_gate: 5.0 # 两端点误差和 / 预测灯条长度
 measurement_bearing_variance: 0.004 # rad²
 measurement_elevation_variance: 0.004 # rad²
 measurement_distance_variance_slope: 1.0 # 距离方差对数项系数，单位 m²
 measurement_distance_variance_offset: 1.0 # m²
 measurement_armor_yaw_variance_slope: 0.005 # 距离对数项系数，单位 rad²
 measurement_armor_yaw_variance_offset: 0.09 # rad²
+measurement_armor_tilt_variance: 0.09 # rad²，装甲板 roll/pitch 观测方差
 distance_update_r_scale: 1.0
 yaw_update_sigma_deg: 0.0 # 0 表示保持配置的基准 yaw 方差
-tracker_max_prediction_gap: 0.1 # s，保持哨兵旧版时间间隔重置边界
+tracker_max_prediction_gap: 0.15 # s，需高于 0.1 s 告警阈值；间隔超过 150 ms 才重建目标
 
 #####-----aimer参数-----#####
 yaw_offset: -0.8 # degree -2.5
@@ -136,7 +156,9 @@ high_speed_delay_time: 0.026 # 旧版固定延迟项；移植后的 Aimer 按帧
 low_speed_delay_time: 0.010 # 旧版固定延迟项；移植后的 Aimer 按帧时间戳预测，不再读取
 
 #####-----Planner参数-----#####
-# 先沿用 SRM 的 MPC 权重与约束；哨兵的响应延迟未实测，补偿和换板提前量先关闭。
+# MPC 权重与约束；哨兵云台响应延迟未实测，额外响应补偿和预览提前量先关闭。
+ballistic_resistance: 0.092 # 1/m，水平二次阻力 dv/dt=-k·v²；0 退回真空模型
+ballistic_gravity: 9.7833 # m/s²
 fire_thresh: 0.003 # rad，反馈/参考合成误差上限
 planner_max_iter: 30 # TinyMPC 每帧最大迭代次数
 planner_gimbal_response_delay_ms: 0 # ms，实测后再设置

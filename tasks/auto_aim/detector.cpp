@@ -4,6 +4,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include <filesystem>
+#include <utility>
 
 #include "tools/img_tools.hpp"
 #include "tools/logger.hpp"
@@ -25,9 +26,38 @@ Detector::Detector(const std::string & config_path, bool debug)
   max_side_ratio_ = yaml["max_side_ratio"].as<double>();
   min_confidence_ = yaml["min_confidence"].as<double>();
   max_rectangular_error_ = yaml["max_rectangular_error"].as<double>() / 57.3;  // degree to rad
+  single_lightbar_detection_enabled_ = yaml["single_lightbar_update_enabled"].IsDefined()
+    ? yaml["single_lightbar_update_enabled"].as<bool>() : true;
 
   save_path_ = "patterns";
   std::filesystem::create_directory(save_path_);
+}
+
+std::list<Lightbar> Detector::detect_lightbars(const cv::Mat & bgr_img) const
+{
+  std::list<Lightbar> lightbars;
+  if (!single_lightbar_detection_enabled_ || bgr_img.empty()) return lightbars;
+
+  cv::Mat gray_img;
+  cv::cvtColor(bgr_img, gray_img, cv::COLOR_BGR2GRAY);
+  cv::Mat binary_img;
+  cv::threshold(gray_img, binary_img, threshold_, 255, cv::THRESH_BINARY);
+
+  std::vector<std::vector<cv::Point>> contours;
+  cv::findContours(binary_img, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
+  std::size_t lightbar_id = 0;
+  for (const auto & contour : contours) {
+    auto lightbar = Lightbar(cv::minAreaRect(contour), lightbar_id);
+    if (!check_geometry(lightbar)) continue;
+    lightbar.color = get_color(bgr_img, contour);
+    lightbars.emplace_back(std::move(lightbar));
+    ++lightbar_id;
+  }
+
+  lightbars.sort([](const Lightbar & a, const Lightbar & b) {
+    return a.center.x < b.center.x;
+  });
+  return lightbars;
 }
 
 std::list<Armor> Detector::detect(const cv::Mat & bgr_img, int frame_count)

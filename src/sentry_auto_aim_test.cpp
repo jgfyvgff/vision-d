@@ -303,7 +303,8 @@ int run(int argc, char * argv[])
     const auto gimbal_pos = tools::eulers(solver.R_gimbal2world(), 2, 1, 0);
 
     auto armors = yolo.detect(frame.image);
-    auto targets = tracker.track(armors, frame.timestamp);
+    auto lightbars = yolo.detect_lightbars(frame.image);
+    auto targets = tracker.track(armors, lightbars, frame.timestamp);
     const auto tracker_state = tracker.state();
     const auto gimbal_state = gimbal.state();
 
@@ -419,8 +420,12 @@ int run(int argc, char * argv[])
       data["planner_preview_switch_step"] = plan.preview_switch_step;
       data["planner_tx_spike_suppressed"] = plan.tx_yaw_spike_suppressed ? 1 : 0;
       if (!targets.empty()) {
-        const auto x = targets.front().ekf_x();
-        data["tracker_center_yaw_deg"] = x[6] * RAD_TO_DEG;
+        const auto & target = targets.front();
+        const auto x = target.ekf_x();
+        const auto center_ypr = target.center_ypr();
+        data["tracker_center_yaw_deg"] = center_ypr[0] * RAD_TO_DEG;
+        data["tracker_center_pitch_deg"] = center_ypr[1] * RAD_TO_DEG;
+        data["tracker_center_roll_deg"] = center_ypr[2] * RAD_TO_DEG;
         data["tracker_angular_velocity_rad_s"] = x[7];
       }
       if (aimer_called && aimer.debug_aim_point.valid) {
@@ -471,15 +476,23 @@ int run(int argc, char * argv[])
           data["tracker_vy_mps"] = x[3];
           data["tracker_z_m"] = x[4];
           data["tracker_vz_mps"] = x[5];
-          data["tracker_yaw_rad"] = x[6];
+          const auto center_ypr = target.center_ypr();
+          data["tracker_yaw_rad"] = center_ypr[0];
+          data["tracker_pitch_rad"] = center_ypr[1];
+          data["tracker_roll_rad"] = center_ypr[2];
           data["tracker_angular_velocity_rad_s"] = x[7];
           data["tracker_r1_m"] = x[8];
           data["tracker_r2_m"] = x[9];
           data["tracker_dz_m"] = x[10];
+          data["tracker_rot_y_component_rad"] = x[11];
+          data["tracker_rot_x_component_rad"] = x[12];
           data["tracker_last_armor_id"] = target.last_id;
           const auto & metrics = target.ekf().data;
           for (const char * key : {
                  "residual_yaw", "residual_pitch", "residual_distance", "residual_angle",
+                 "residual_armor_roll", "residual_armor_pitch", "residual_armor_yaw",
+                 "residual_uvl_angle", "residual_uvl_center_u", "residual_uvl_center_v",
+                 "residual_uvl_length",
                  "nis", "nees", "nis_fail", "nees_fail", "recent_nis_failures"}) {
             const auto it = metrics.find(key);
             if (it != metrics.end()) data[key] = it->second;

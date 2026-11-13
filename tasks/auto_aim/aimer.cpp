@@ -3,6 +3,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include <cmath>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -21,6 +22,16 @@ Aimer::Aimer(const std::string & config_path)
   comming_angle_ = yaml["comming_angle"].as<double>() / 57.3;  // degree to rad
   leaving_angle_ = yaml["leaving_angle"].as<double>() / 57.3;  // degree to rad
   decision_speed_ = yaml["decision_speed"].as<double>();
+  ballistic_resistance_ = yaml["ballistic_resistance"].IsDefined()
+                            ? yaml["ballistic_resistance"].as<double>()
+                            : 0.092;
+  ballistic_gravity_ = yaml["ballistic_gravity"].IsDefined()
+                         ? yaml["ballistic_gravity"].as<double>()
+                         : 9.7833;
+  if (!std::isfinite(ballistic_resistance_) || ballistic_resistance_ < 0.0 ||
+      !std::isfinite(ballistic_gravity_) || ballistic_gravity_ <= 0.0) {
+    throw std::invalid_argument("Invalid ballistic resistance or gravity configuration");
+  }
   if (yaml["left_yaw_offset"].IsDefined() && yaml["right_yaw_offset"].IsDefined()) {
     left_yaw_offset_ = yaml["left_yaw_offset"].as<double>() / 57.3;    // degree to rad
     right_yaw_offset_ = yaml["right_yaw_offset"].as<double>() / 57.3;  // degree to rad
@@ -98,7 +109,8 @@ io::Command Aimer::aim_impl(
 
   Eigen::Vector3d xyz0 = aim_point0.xyza.head(3);//head(3)取前三个元素
   auto d0 = std::sqrt(xyz0[0] * xyz0[0] + xyz0[1] * xyz0[1]);//计算距离
-  tools::Trajectory trajectory0(bullet_speed, d0, xyz0[2]);
+  tools::Trajectory trajectory0(
+    bullet_speed, d0, xyz0[2], ballistic_resistance_, ballistic_gravity_);
   if (trajectory0.unsolvable) {
     tools::logger()->debug(
       "[Aimer] Unsolvable trajectory0: {:.2f} {:.2f} {:.2f}", bullet_speed, d0, xyz0[2]);
@@ -133,7 +145,8 @@ io::Command Aimer::aim_impl(
     // 计算新弹道
     Eigen::Vector3d xyz = aim_point.xyza.head(3);
     double d = std::sqrt(xyz.x() * xyz.x() + xyz.y() * xyz.y());
-    current_traj = tools::Trajectory(bullet_speed, d, xyz.z());
+    current_traj = tools::Trajectory(
+      bullet_speed, d, xyz.z(), ballistic_resistance_, ballistic_gravity_);
 
     // 检查弹道是否可解
     if (current_traj.unsolvable) {

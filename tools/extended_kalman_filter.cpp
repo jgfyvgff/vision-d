@@ -2,8 +2,10 @@
 
 #include <array>
 #include <cmath>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
+#include <string>
 
 namespace
 {
@@ -40,6 +42,17 @@ ExtendedKalmanFilter::ExtendedKalmanFilter(
   data["residual_pitch"] = 0.0;
   data["residual_distance"] = 0.0;
   data["residual_angle"] = 0.0;
+  data["residual_armor_roll"] = 0.0;
+  data["residual_armor_pitch"] = 0.0;
+  data["residual_armor_yaw"] = 0.0;
+  data["residual_uvl_angle"] = 0.0;
+  data["residual_uvl_center_u"] = 0.0;
+  data["residual_uvl_center_v"] = 0.0;
+  data["residual_uvl_length"] = 0.0;
+  data["residual_observation_0"] = 0.0;
+  data["residual_observation_1"] = 0.0;
+  data["residual_observation_2"] = 0.0;
+  data["residual_observation_3"] = 0.0;
   data["nis"] = 0.0;
   data["nees"] = 0.0;
   data["nis_fail"] = 0.0;
@@ -112,7 +125,7 @@ Eigen::VectorXd ExtendedKalmanFilter::update(
   double nis = residual.transpose() * S_nis.inverse() * residual;
   double nees = (x - x_prior).transpose() * P.inverse() * (x - x_prior);
 
-  // 95% 上分位点用于拒绝过大的创新；四维自瞄观测对应 9.488。
+  // 按观测维度选 95% 卡方上分位点；加入 SO(3) 姿态后自瞄观测为六维。
   const double nis_threshold = chi_square_95_threshold(residual.size());
   constexpr double nees_threshold = 0.711;
 
@@ -149,6 +162,125 @@ Eigen::VectorXd ExtendedKalmanFilter::update(
   data["nees"] = nees;
   data["recent_nis_failures"] = recent_rate;
 
+  return x;
+}
+
+Eigen::VectorXd ExtendedKalmanFilter::update_iterated_multi(
+  const std::vector<ErrorStateObservation> & observations, int iteration_num)
+{
+  if (observations.empty()) {
+    throw std::invalid_argument("Iterated ESEKF update requires at least one observation");
+  }
+  if (iteration_num < 1) {
+    throw std::invalid_argument("Iterated ESEKF update requires a positive iteration count");
+  }
+
+  Eigen::Index total_measurement_size = 0;
+  for (const auto & observation : observations) {
+    const auto dimension = observation.z.size();
+    if (dimension <= 0 || observation.R.rows() != dimension ||
+        observation.R.cols() != dimension || !observation.predict ||
+        !observation.residual || !observation.jacobian) {
+      throw std::invalid_argument("Invalid iterated ESEKF observation factor");
+    }
+    total_measurement_size += dimension;
+  }
+
+  const Eigen::VectorXd x_prior = x;
+  const Eigen::MatrixXd P_prior = P;
+  Eigen::VectorXd delta_iter = Eigen::VectorXd::Zero(x_prior.size());
+  Eigen::MatrixXd H = Eigen::MatrixXd::Zero(total_measurement_size, x_prior.size());
+  Eigen::MatrixXd R = Eigen::MatrixXd::Zero(total_measurement_size, total_measurement_size);
+  Eigen::VectorXd residual = Eigen::VectorXd::Zero(total_measurement_size);
+  Eigen::MatrixXd K = Eigen::MatrixXd::Zero(x_prior.size(), total_measurement_size);
+  Eigen::MatrixXd S;
+  Eigen::LDLT<Eigen::MatrixXd> ldlt;
+
+  for (int iteration = 0; iteration < iteration_num; ++iteration) {
+    const Eigen::VectorXd x_iter = x_add(x_prior, delta_iter);
+    Eigen::Index offset = 0;
+    for (const auto & observation : observations) {
+      const Eigen::Index dimension = observation.z.size();
+      const Eigen::VectorXd predicted = observation.predict(x_iter);
+      const Eigen::VectorXd factor_residual = observation.residual(predicted, observation.z);
+      const Eigen::MatrixXd factor_jacobian = observation.jacobian(x_iter);
+      if (predicted.size() != dimension || factor_residual.size() != dimension ||
+          factor_jacobian.rows() != dimension || factor_jacobian.cols() != x_prior.size() ||
+          !predicted.allFinite() || !factor_residual.allFinite() ||
+          !factor_jacobian.allFinite() || !observation.R.allFinite()) {
+        throw std::runtime_error("Non-finite or dimensionally invalid ESEKF observation");
+      }
+      H.block(offset, 0, dimension, x_prior.size()) = factor_jacobian;
+      residual.segment(offset, dimension) = factor_residual;
+      R.block(offset, offset, dimension, dimension) = observation.R;
+      offset += dimension;
+    }
+
+    S = H * P_prior * H.transpose() + R;
+    ldlt.compute(S);
+    if (ldlt.info() != Eigen::Success) {
+      throw std::runtime_error("ESEKF innovation covariance factorization failed");
+    }
+    K = P_prior * H.transpose() * ldlt.solve(
+      Eigen::MatrixXd::Identity(total_measurement_size, total_measurement_size));
+    if (!K.allFinite()) {
+      throw std::runtime_error("ESEKF gain is non-finite");
+    }
+    // 加回当前线性化点到先验的误差项，保持线性观测下与一次 EKF 后验一致。
+    delta_iter = K * (residual + H * delta_iter);
+  }
+
+  x = x_add(x_prior, delta_iter);
+  P = (I - K * H) * P_prior * (I - K * H).transpose() + K * R * K.transpose();
+  P = 0.5 * (P + P.transpose());
+
+  last_innovation = residual;
+  last_measurement_noise = R;
+  last_nis_measurement_noise = R;
+  last_innovation_covariance = S;
+  last_nis_innovation_covariance = S;
+  last_kalman_gain = K;
+  const double nis = residual.dot(ldlt.solve(residual));
+  Eigen::LDLT<Eigen::MatrixXd> posterior_ldlt(P);
+  const double nees = posterior_ldlt.info() == Eigen::Success
+    ? delta_iter.dot(posterior_ldlt.solve(delta_iter))
+    : std::numeric_limits<double>::infinity();
+  const double nis_threshold = chi_square_95_threshold(total_measurement_size);
+  const bool nis_failed = !std::isfinite(nis) || nis > nis_threshold;
+  data["nis_fail"] = nis_failed ? 1.0 : 0.0;
+  data["nees_fail"] = nees > 0.711 ? 1.0 : 0.0;
+  if (nis_failed) ++nis_count_;
+  if (nees > 0.711) ++nees_count_;
+  ++total_count_;
+  last_nis = nis;
+  recent_nis_failures.push_back(nis_failed ? 1 : 0);
+  if (recent_nis_failures.size() > window_size) recent_nis_failures.pop_front();
+  const int recent_failures =
+    std::accumulate(recent_nis_failures.begin(), recent_nis_failures.end(), 0);
+  const double recent_rate =
+    static_cast<double>(recent_failures) / recent_nis_failures.size();
+
+  for (Eigen::Index component = 0; component < 4; ++component) {
+    double mean_residual = 0.0;
+    Eigen::Index count = 0;
+    for (Eigen::Index index = component; index < residual.size(); index += 4) {
+      mean_residual += residual[index];
+      ++count;
+    }
+    data["residual_observation_" + std::to_string(component)] =
+      count > 0 ? mean_residual / static_cast<double>(count) : 0.0;
+  }
+  data["residual_uvl_angle"] = data["residual_observation_0"];
+  data["residual_uvl_center_u"] = data["residual_observation_1"];
+  data["residual_uvl_center_v"] = data["residual_observation_2"];
+  data["residual_uvl_length"] = data["residual_observation_3"];
+  data["residual_yaw"] = 0.0;
+  data["residual_pitch"] = 0.0;
+  data["residual_distance"] = 0.0;
+  data["residual_angle"] = 0.0;
+  data["nis"] = nis;
+  data["nees"] = nees;
+  data["recent_nis_failures"] = recent_rate;
   return x;
 }
 

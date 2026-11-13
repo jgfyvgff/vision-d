@@ -10,7 +10,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     find_package(yaml-cpp REQUIRED)
 endif()
 
-add_library(uvc_calibration STATIC uvc_calibration.cpp)
+add_library(uvc_calibration STATIC uvc_calibration.cpp uvc_handeye.cpp)
 target_include_directories(uvc_calibration PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/.. ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(uvc_calibration PUBLIC ${OpenCV_LIBS} yaml-cpp)
 

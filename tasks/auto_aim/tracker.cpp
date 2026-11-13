@@ -20,7 +20,7 @@
 
 namespace
 {
-using P0Diagonal = std::array<double, 11>;
+using P0Diagonal = std::array<double, 13>;
 
 P0Diagonal read_p0_diagonal(
   const YAML::Node & yaml, const char * key, const P0Diagonal & fallback)
@@ -28,7 +28,7 @@ P0Diagonal read_p0_diagonal(
   const auto node = yaml[key];
   if (!node.IsDefined()) return fallback;
   if (!node.IsSequence() || node.size() != fallback.size()) {
-    throw std::runtime_error(std::string("Invalid ") + key + ": expected 11 diagonal values");
+    throw std::runtime_error(std::string("Invalid ") + key + ": expected 13 diagonal values");
   }
 
   P0Diagonal values{};
@@ -63,17 +63,59 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
   omni_target_priority_{ArmorPriority::fifth}//哨兵
 {
   auto yaml = YAML::LoadFile(config_path);
+  observation_model_ = yaml["tracker_observation_model"].IsDefined()
+    ? yaml["tracker_observation_model"].as<std::string>() : "uvl";
+  uvl_iteration_num_ = yaml["esekf_iter_num"].IsDefined()
+    ? yaml["esekf_iter_num"].as<int>() : 5;
+  const auto read_qxyz = [&yaml](const char * key, const Eigen::Vector3d & fallback) {
+      if (!yaml[key].IsDefined()) return fallback;
+      const auto values = yaml[key].as<std::vector<double>>();
+      if (values.size() != 3) {
+        throw std::runtime_error(std::string("Expected three values for ") + key);
+      }
+      return Eigen::Vector3d(values[0], values[1], values[2]);
+    };
+  qxyz_common_ = read_qxyz("qxyz_common", qxyz_common_);
+  qxyz_output_ = read_qxyz("qxyz_output", qxyz_output_);
+  qyaw_common_ = yaml["qyaw_common"].IsDefined()
+    ? yaml["qyaw_common"].as<double>() : qyaw_common_;
+  qyaw_output_ = yaml["qyaw_output"].IsDefined()
+    ? yaml["qyaw_output"].as<double>() : qyaw_output_;
+  q_radius_ = yaml["q_r"].IsDefined() ? yaml["q_r"].as<double>() : q_radius_;
+  q_height_ = yaml["q_h"].IsDefined() ? yaml["q_h"].as<double>() : q_height_;
+  q_wpr_ = yaml["q_wpr"].IsDefined() ? yaml["q_wpr"].as<double>() : q_wpr_;
+  uvl_sigma_angle_ = yaml["r_sigma_angle"].IsDefined()
+    ? yaml["r_sigma_angle"].as<double>() : uvl_sigma_angle_;
+  uvl_sigma_px_by_length_ratio_ = yaml["r_sigma_px_by_length_ratio"].IsDefined()
+    ? yaml["r_sigma_px_by_length_ratio"].as<double>() : uvl_sigma_px_by_length_ratio_;
+  uvl_sigma_length_by_length_ratio_ = yaml["r_sigma_length_by_length_ratio"].IsDefined()
+    ? yaml["r_sigma_length_by_length_ratio"].as<double>()
+    : uvl_sigma_length_by_length_ratio_;
+  single_lightbar_update_enabled_ = yaml["single_lightbar_update_enabled"].IsDefined()
+    ? yaml["single_lightbar_update_enabled"].as<bool>() : single_lightbar_update_enabled_;
+  lightbar_match_length_ratio_gate_ = yaml["single_lightbar_length_ratio_gate"].IsDefined()
+    ? yaml["single_lightbar_length_ratio_gate"].as<double>()
+    : lightbar_match_length_ratio_gate_;
+  lightbar_match_angle_gate_rad_ = yaml["single_lightbar_angle_gate_rad"].IsDefined()
+    ? yaml["single_lightbar_angle_gate_rad"].as<double>() : lightbar_match_angle_gate_rad_;
+  lightbar_match_position_ratio_gate_ =
+    yaml["single_lightbar_position_ratio_gate"].IsDefined()
+      ? yaml["single_lightbar_position_ratio_gate"].as<double>()
+      : lightbar_match_position_ratio_gate_;
   enemy_color_ = (yaml["enemy_color"].as<std::string>() == "red") ? Color::red : Color::blue;
   min_detect_count_ = yaml["min_detect_count"].as<int>();//连续检测到目标的最小次数
   max_temp_lost_count_ = yaml["max_temp_lost_count"].as<int>();//连续丢失目标的最大次数
   outpost_max_temp_lost_count_ = yaml["outpost_max_temp_lost_count"].as<int>();//前哨站连续丢失目标的最大次数
   normal_temp_lost_count_ = max_temp_lost_count_;//普通模式连续丢失目标的最大次数
   balance_initial_covariance_diagonal_ = read_p0_diagonal(
-    yaml, "balance_initial_covariance_diagonal", P0Diagonal{1, 64, 1, 64, 1, 64, 0.4, 100, 1, 1, 1});
+    yaml, "balance_initial_covariance_diagonal",
+    P0Diagonal{1, 64, 1, 64, 1, 64, 0.4, 100, 1, 1, 1, 0.25, 0.25});
   outpost_initial_covariance_diagonal_ = read_p0_diagonal(
-    yaml, "outpost_initial_covariance_diagonal", P0Diagonal{1, 64, 1, 64, 1, 81, 0.4, 100, 1e-4, 0, 0});
+    yaml, "outpost_initial_covariance_diagonal",
+    P0Diagonal{1, 64, 1, 64, 1, 81, 0.4, 100, 1e-4, 0, 0, 0.25, 0.25});
   base_initial_covariance_diagonal_ = read_p0_diagonal(
-    yaml, "base_initial_covariance_diagonal", P0Diagonal{1, 64, 1, 64, 1, 64, 0.4, 100, 1e-4, 0, 0});
+    yaml, "base_initial_covariance_diagonal",
+    P0Diagonal{1, 64, 1, 64, 1, 64, 0.4, 100, 1e-4, 0, 0, 0.25, 0.25});
 
   standard_geometry_constraint_ = yaml["standard_geometry_constraint"].IsDefined()
                                     ? yaml["standard_geometry_constraint"].as<bool>()
@@ -104,6 +146,9 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
   standard_initial_center_yaw_variance_ = yaml["standard_initial_center_yaw_variance"].IsDefined()
                                             ? yaml["standard_initial_center_yaw_variance"].as<double>()
                                             : 0.4;
+  standard_initial_tilt_variance_ = yaml["standard_initial_tilt_variance"].IsDefined()
+                                      ? yaml["standard_initial_tilt_variance"].as<double>()
+                                      : 0.25;
   standard_initial_velocity_variance_ =
     yaml["standard_initial_velocity_variance"].IsDefined()
       ? yaml["standard_initial_velocity_variance"].as<double>()
@@ -194,6 +239,9 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
   measurement_armor_yaw_variance_offset_ = yaml["measurement_armor_yaw_variance_offset"].IsDefined()
                                              ? yaml["measurement_armor_yaw_variance_offset"].as<double>()
                                              : 9e-2;
+  measurement_armor_tilt_variance_ = yaml["measurement_armor_tilt_variance"].IsDefined()
+                                       ? yaml["measurement_armor_tilt_variance"].as<double>()
+                                       : 9e-2;
   distance_update_r_scale_ = yaml["distance_update_r_scale"].IsDefined()
                                ? yaml["distance_update_r_scale"].as<double>()
                                : 1.0;
@@ -203,6 +251,9 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
   max_prediction_gap_ = yaml["tracker_max_prediction_gap"].IsDefined()
                           ? yaml["tracker_max_prediction_gap"].as<double>()
                           : 0.3;
+  candidate_separation_min_m_ = yaml["candidate_target_separation_m"].IsDefined()
+                                  ? yaml["candidate_target_separation_m"].as<double>()
+                                  : 0.65;
 
   const auto valid_radius = [](double radius) {
     return std::isfinite(radius) && radius > 0.05 && radius < 0.5;
@@ -215,6 +266,8 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
     !std::isfinite(standard_initial_position_variance_) || standard_initial_position_variance_ <= 0.0 ||
     !std::isfinite(standard_initial_center_yaw_variance_) ||
     standard_initial_center_yaw_variance_ <= 0.0 ||
+    !std::isfinite(standard_initial_tilt_variance_) ||
+    standard_initial_tilt_variance_ <= 0.0 ||
     !std::isfinite(standard_initial_velocity_variance_) ||
     standard_initial_velocity_variance_ <= 0 ||
     !std::isfinite(standard_initial_angular_velocity_variance_) ||
@@ -239,6 +292,32 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
   if (std::any_of(process_noise_variances.begin(), process_noise_variances.end(),
       [](double value) { return !std::isfinite(value) || value <= 0.0; })) {
     throw std::runtime_error("Invalid target process noise variance configuration");
+  }
+  const std::array<double, 8> uvl_noise_parameters{
+    qxyz_common_.x(), qxyz_common_.y(), qxyz_common_.z(), qxyz_output_.x(),
+    qxyz_output_.y(), qxyz_output_.z(), qyaw_common_, qyaw_output_};
+  if (observation_model_ != "uvl" && observation_model_ != "pnp_ypd") {
+    throw std::runtime_error("tracker_observation_model must be 'uvl' or 'pnp_ypd'");
+  }
+  if (uvl_iteration_num_ < 1 || uvl_iteration_num_ > 20 ||
+      std::any_of(uvl_noise_parameters.begin(), uvl_noise_parameters.end(),
+        [](double value) { return !std::isfinite(value) || value <= 0.0; }) ||
+      !std::isfinite(q_radius_) || q_radius_ <= 0.0 ||
+      !std::isfinite(q_height_) || q_height_ <= 0.0 ||
+      !std::isfinite(q_wpr_) || q_wpr_ <= 0.0 ||
+      !std::isfinite(uvl_sigma_angle_) || uvl_sigma_angle_ <= 0.0 ||
+      !std::isfinite(uvl_sigma_px_by_length_ratio_) || uvl_sigma_px_by_length_ratio_ <= 0.0 ||
+      !std::isfinite(uvl_sigma_length_by_length_ratio_) ||
+      uvl_sigma_length_by_length_ratio_ <= 0.0) {
+    throw std::runtime_error("Invalid UVL/ESEKF noise configuration");
+  }
+  if (!std::isfinite(lightbar_match_length_ratio_gate_) ||
+      lightbar_match_length_ratio_gate_ <= 0.0 || lightbar_match_length_ratio_gate_ >= 1.0 ||
+      !std::isfinite(lightbar_match_angle_gate_rad_) ||
+      lightbar_match_angle_gate_rad_ <= 0.0 || lightbar_match_angle_gate_rad_ > CV_PI ||
+      !std::isfinite(lightbar_match_position_ratio_gate_) ||
+      lightbar_match_position_ratio_gate_ <= 0.0) {
+    throw std::runtime_error("Invalid single lightbar association gate configuration");
   }
   if (
     standard_max_angular_velocity_ &&
@@ -279,10 +358,11 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
       measurement_bearing_variance_ <= 0.0) {
     throw std::runtime_error("Invalid measurement_bearing_variance configuration");
   }
-  const std::array<double, 6> measurement_noise_parameters{
+  const std::array<double, 7> measurement_noise_parameters{
     measurement_elevation_variance_, measurement_distance_variance_log_scale_,
     measurement_distance_variance_offset_, measurement_armor_yaw_variance_log_scale_,
-    measurement_armor_yaw_variance_offset_, distance_update_r_scale_};
+    measurement_armor_yaw_variance_offset_, measurement_armor_tilt_variance_,
+    distance_update_r_scale_};
   if (std::any_of(measurement_noise_parameters.begin(), measurement_noise_parameters.end(),
       [](double value) { return !std::isfinite(value); }) ||
       measurement_elevation_variance_ <= 0.0 ||
@@ -290,6 +370,7 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
       measurement_distance_variance_offset_ <= 0.0 ||
       measurement_armor_yaw_variance_log_scale_ < 0.0 ||
       measurement_armor_yaw_variance_offset_ <= 0.0 ||
+      measurement_armor_tilt_variance_ <= 0.0 ||
       distance_update_r_scale_ < 1.0 || distance_update_r_scale_ > 1e6 ||
       !std::isfinite(yaw_update_sigma_deg_) || yaw_update_sigma_deg_ < 0.0 ||
       yaw_update_sigma_deg_ > 180.0) {
@@ -298,6 +379,25 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
   if (!std::isfinite(max_prediction_gap_) ||
       max_prediction_gap_ <= tracker_time_policy::large_dt_warning_seconds) {
     throw std::runtime_error("Invalid tracker_max_prediction_gap configuration");
+  }
+  if (!std::isfinite(candidate_separation_min_m_) ||
+      candidate_separation_min_m_ <= 0.0 || candidate_separation_min_m_ > 5.0) {
+    throw std::runtime_error("Invalid candidate_target_separation_m configuration");
+  }
+}
+
+void Tracker::configure_observation_model(Target & target) const
+{
+  if (observation_model_ != "uvl") return;
+  target.set_uvl_noise_model(
+    uvl_sigma_angle_, uvl_sigma_px_by_length_ratio_,
+    uvl_sigma_length_by_length_ratio_);
+  if (target.name == ArmorName::outpost) {
+    target.set_awakening_process_noise(
+      qxyz_output_, qyaw_output_, q_radius_, q_height_, q_wpr_);
+  } else {
+    target.set_awakening_process_noise(
+      qxyz_common_, qyaw_common_, q_radius_, q_height_, q_wpr_);
   }
 }
 
@@ -406,8 +506,210 @@ const Target * Tracker::diagnostic_target() const
   return &target_;
 }
 
+void Tracker::update_candidate_target(
+  std::list<Armor> & armors, std::chrono::steady_clock::time_point t,
+  bool use_enemy_color, bool allow_new_candidate)
+{
+  // switching/lost 由全向转向逻辑接管；候选只在当前车辆仍可预测时并行积累。
+  if (state_ == "lost" || state_ == "switching") {
+    if (candidate_valid_) {
+      candidate_valid_ = false;
+      candidate_detect_count_ = 0;
+      candidate_temp_lost_count_ = 0;
+    }
+    return;
+  }
+
+  if (candidate_valid_ &&
+      (std::chrono::duration<double>(t - candidate_last_timestamp_).count() >
+         max_prediction_gap_ || t < candidate_last_timestamp_)) {
+    candidate_valid_ = false;
+    candidate_detect_count_ = 0;
+    candidate_temp_lost_count_ = 0;
+  }
+
+  target_.predict(t);
+  const auto primary_armors = target_.armor_xyza_list();
+  const auto is_separate_from_primary = [&](const Armor & armor) {
+    if (primary_armors.empty()) return true;
+    double nearest = std::numeric_limits<double>::infinity();
+    for (const auto & predicted : primary_armors) {
+      nearest = std::min(nearest, (armor.xyz_in_world - predicted.head<3>()).norm());
+    }
+    return nearest >= candidate_separation_min_m_;
+  };
+
+  if (!candidate_valid_) {
+    if (!allow_new_candidate) return;
+    // 初始化只取离主目标预测装甲板足够远的首个可解观测，避免把主车另一块板当成第二辆车。
+    for (auto & detection : armors) {
+      if (use_enemy_color && detection.color != enemy_color_) continue;
+      Armor observed = detection;
+      try {
+        solver_.solve(observed);
+      } catch (const cv::Exception &) {
+        continue;
+      }
+      if (!observed.xyz_in_world.allFinite() || !is_separate_from_primary(observed)) continue;
+
+      const bool is_balance = observed.type == ArmorType::big &&
+        (observed.name == ArmorName::three || observed.name == ArmorName::four ||
+         observed.name == ArmorName::five);
+      const bool is_standard_four = !is_balance && observed.name != ArmorName::outpost &&
+        observed.name != ArmorName::base;
+      if (is_balance) {
+        candidate_target_ = Target(
+          observed, t, balance_radius_, 2, to_eigen_vector(balance_initial_covariance_diagonal_));
+        candidate_geometry_branch_ = "balance_two";
+        candidate_target_.set_process_noise_variances(
+          balance_translation_acceleration_variance_, balance_angular_acceleration_variance_);
+      } else if (observed.name == ArmorName::outpost) {
+        candidate_target_ = Target(
+          observed, t, outpost_radius_, 3, to_eigen_vector(outpost_initial_covariance_diagonal_));
+        candidate_geometry_branch_ = "outpost_three";
+        candidate_target_.set_process_noise_variances(
+          outpost_translation_acceleration_variance_, outpost_angular_acceleration_variance_);
+      } else if (observed.name == ArmorName::base) {
+        candidate_target_ = Target(
+          observed, t, base_radius_, 3, to_eigen_vector(base_initial_covariance_diagonal_));
+        candidate_geometry_branch_ = "base_three";
+        candidate_target_.set_process_noise_variances(
+          base_translation_acceleration_variance_, base_angular_acceleration_variance_);
+      } else if (is_standard_four) {
+        Eigen::VectorXd covariance{{
+          standard_initial_position_variance_, standard_initial_velocity_variance_,
+          standard_initial_position_variance_, standard_initial_velocity_variance_,
+          standard_initial_position_variance_, standard_initial_velocity_variance_,
+          standard_initial_center_yaw_variance_, standard_initial_angular_velocity_variance_,
+          standard_radius_variance_, standard_radius_delta_variance_,
+          standard_height_delta_variance_, standard_initial_tilt_variance_,
+          standard_initial_tilt_variance_}};
+        candidate_target_ = Target(observed, t, standard_radius_, 4, covariance);
+        candidate_geometry_branch_ = "standard_four";
+        candidate_target_.set_process_noise_variances(
+          standard_translation_acceleration_variance_, standard_angular_acceleration_variance_);
+        if (standard_geometry_constraint_) {
+          candidate_target_.set_geometry_constraint(
+            standard_radius_, 0.0, standard_radius_variance_, standard_radius_delta_variance_);
+        } else if (standard_radius_delta_constraint_) {
+          candidate_target_.set_radius_delta_constraint(0.0, standard_radius_delta_variance_);
+        }
+      } else {
+        continue;
+      }
+      configure_observation_model(candidate_target_);
+      candidate_target_.set_measurement_bearing_variance(measurement_bearing_variance_);
+      candidate_target_.set_measurement_noise_model(
+        measurement_elevation_variance_, measurement_distance_variance_log_scale_,
+        measurement_distance_variance_offset_, measurement_armor_yaw_variance_log_scale_,
+        measurement_armor_yaw_variance_offset_);
+      candidate_target_.set_measurement_armor_tilt_variance(measurement_armor_tilt_variance_);
+      candidate_valid_ = true;
+      candidate_detect_count_ = 1;
+      candidate_temp_lost_count_ = 0;
+      candidate_last_timestamp_ = t;
+      break;
+    }
+    return;
+  }
+
+  candidate_target_.predict(t);
+  const auto predicted_armors = candidate_target_.armor_xyza_list();
+  std::optional<Armor> best_observation;
+  int best_id = -1;
+  double best_distance = std::numeric_limits<double>::infinity();
+  for (auto & detection : armors) {
+    if (detection.name != candidate_target_.name ||
+        detection.type != candidate_target_.armor_type ||
+        (use_enemy_color && detection.color != enemy_color_)) {
+      continue;
+    }
+    for (std::size_t id = 0; id < predicted_armors.size(); ++id) {
+      Armor observed = detection;
+      try {
+        solver_.solve(observed, predicted_armors[id]);
+      } catch (const cv::Exception &) {
+        continue;
+      }
+      if (!observed.xyz_in_world.allFinite() || !is_separate_from_primary(observed)) continue;
+      const auto matches = candidate_target_.match_armors(observed);
+      const auto match = std::find_if(matches.begin(), matches.end(), [id](const auto & value) {
+        return value.id == static_cast<int>(id) && value.valid;
+      });
+      if (match == matches.end() ||
+          match->mahalanobis_distance > association_max_mahalanobis_distance_ ||
+          match->mahalanobis_distance >= best_distance) {
+        continue;
+      }
+      best_observation = std::move(observed);
+      best_id = static_cast<int>(id);
+      best_distance = match->mahalanobis_distance;
+    }
+  }
+
+  const auto candidate_max_angular_velocity =
+    candidate_geometry_branch_ == "standard_four"
+      ? standard_max_angular_velocity_ : std::optional<double>{};
+  const bool candidate_update_accepted = best_observation &&
+    (observation_model_ == "uvl"
+      ? candidate_target_.update_uvl(
+          {{&best_observation.value(), best_id}}, solver_, uvl_iteration_num_,
+          candidate_max_angular_velocity)
+      : candidate_target_.update(
+          *best_observation, best_id, std::nullopt, candidate_max_angular_velocity));
+  if (candidate_update_accepted) {
+    ++candidate_detect_count_;
+    candidate_temp_lost_count_ = 0;
+  } else {
+    candidate_detect_count_ = 0;
+    ++candidate_temp_lost_count_;
+  }
+  candidate_last_timestamp_ = t;
+  if (candidate_target_.diverged() || candidate_temp_lost_count_ > max_temp_lost_count_) {
+    candidate_valid_ = false;
+    candidate_detect_count_ = 0;
+    candidate_temp_lost_count_ = 0;
+  }
+}
+
+bool Tracker::promote_candidate_if_ready()
+{
+  if (state_ != "temp_lost" || !candidate_valid_ ||
+      candidate_detect_count_ < min_detect_count_) {
+    return false;
+  }
+
+  // 复制整份独立后验，避免从旧主目标状态拼接位置、姿态或协方差。
+  target_ = candidate_target_;
+  tracked_label_ = target_.name;
+  geometry_branch_ = candidate_geometry_branch_;
+  geometry_constraint_active_ = geometry_branch_ == "standard_four" &&
+    (standard_geometry_constraint_ || standard_radius_delta_constraint_);
+  successful_capture_updates_ = std::max(0, candidate_detect_count_ - 1);
+  target_generation_++;
+  observation_accepted_ = true;
+  state_ = "tracking";
+  temp_lost_count_ = 0;
+  candidate_valid_ = false;
+  candidate_detect_count_ = 0;
+  candidate_temp_lost_count_ = 0;
+  candidate_geometry_branch_ = "none";
+  recent_names_.clear();
+  tools::logger()->info("[Tracker] Promoted parallel candidate target after primary loss");
+  return true;
+}
+
 std::list<Target> Tracker::track(
   std::list<Armor> & armors, std::chrono::steady_clock::time_point t, bool use_enemy_color,
+  EndpointRangeShadowMap * endpoint_range_shadow)
+{
+  static const std::list<Lightbar> no_lightbars;
+  return track(armors, no_lightbars, t, use_enemy_color, endpoint_range_shadow);
+}
+
+std::list<Target> Tracker::track(
+  std::list<Armor> & armors, const std::list<Lightbar> & lightbars,
+  std::chrono::steady_clock::time_point t, bool use_enemy_color,
   EndpointRangeShadowMap * endpoint_range_shadow)
 {
   association_debug_ = AssociationDebug{};
@@ -449,6 +751,8 @@ std::list<Target> Tracker::track(
   armors.sort(
     [](const auto_aim::Armor & a, const auto_aim::Armor & b) { return a.priority < b.priority; });
 
+  update_candidate_target(armors, t, true, state_ != "lost" && state_ != "switching");
+
   bool found;
   if (state_ == "lost") {
     recent_names_.clear();
@@ -456,10 +760,11 @@ std::list<Target> Tracker::track(
   }//如果是lost状态，则寻找优先级最高的装甲板
 
   else {
-    found = update_target(armors, t, std::nullopt, endpoint_range_shadow);
+    found = update_target(armors, t, std::nullopt, endpoint_range_shadow, &lightbars);
   }
 
   state_machine(found);
+  promote_candidate_if_ready();
 
   // 发散检测
   if (state_ != "lost" && target_.diverged()) {
@@ -526,6 +831,9 @@ std::tuple<omniperception::DetectionResult, std::list<Target>> Tracker::track(
   // 按优先级排序，优先级最高在首位(优先级越高数字越小，1的优先级最高)
   armors.sort([](const Armor & a, const Armor & b) { return a.priority < b.priority; });
 
+  update_candidate_target(
+    armors, t, use_enemy_color, state_ != "lost" && state_ != "switching");
+
   bool found;
   if (state_ == "lost") {
     found = set_target(armors, t);
@@ -564,6 +872,7 @@ std::tuple<omniperception::DetectionResult, std::list<Target>> Tracker::track(
   pre_state_ = state_;
   // 更新状态机
   state_machine(found);
+  promote_candidate_if_ready();
 
   // 发散检测
   if (state_ != "lost" && target_.diverged()) {
@@ -731,7 +1040,8 @@ bool Tracker::set_target(
        standard_initial_position_variance_, standard_initial_velocity_variance_,
        standard_initial_center_yaw_variance_,
        standard_initial_angular_velocity_variance_, standard_radius_variance_,
-       standard_radius_delta_variance_, standard_height_delta_variance_}};
+       standard_radius_delta_variance_, standard_height_delta_variance_,
+       standard_initial_tilt_variance_, standard_initial_tilt_variance_}};
     target_ = Target(armor, t, standard_radius_, 4, P0_dig);
     target_.set_process_noise_variances(
       standard_translation_acceleration_variance_, standard_angular_acceleration_variance_);
@@ -748,11 +1058,13 @@ bool Tracker::set_target(
     }
   }
 
+  configure_observation_model(target_);
   target_.set_measurement_bearing_variance(measurement_bearing_variance_);
   target_.set_measurement_noise_model(
     measurement_elevation_variance_, measurement_distance_variance_log_scale_,
     measurement_distance_variance_offset_, measurement_armor_yaw_variance_log_scale_,
     measurement_armor_yaw_variance_offset_);
+  target_.set_measurement_armor_tilt_variance(measurement_armor_tilt_variance_);
   if (endpoint_shadow != nullptr) endpoint_shadow->update_accepted = true;
   tracked_label_ = armor.name;
   observation_accepted_ = true;
@@ -763,7 +1075,8 @@ bool Tracker::set_target(
 
 bool Tracker::update_target(
   std::list<Armor> & armors, std::chrono::steady_clock::time_point t,
-  std::optional<NameVote>, EndpointRangeShadowMap * endpoint_range_shadow_map)
+  std::optional<NameVote>, EndpointRangeShadowMap * endpoint_range_shadow_map,
+  const std::list<Lightbar> * lightbars)
 {
   target_.predict(t);
   const auto predicted_armors = target_.armor_xyza_list();
@@ -1087,7 +1400,122 @@ bool Tracker::update_target(
       return candidates[a].detection_index < candidates[b].detection_index;
     });
 
-  bool found = false;
+  const bool uvl_mode = observation_model_ == "uvl";
+  TargetUpdateTrace frame_uvl_trace;
+  bool frame_uvl_accepted = false;
+  std::vector<UVLBarObservation> frame_uvl_bars;
+  std::vector<bool> full_armor_observed(predicted_armors.size(), false);
+  if (uvl_mode) {
+    frame_uvl_bars.reserve(selected_indices.size() * 2);
+    for (const auto selected_index : selected_indices) {
+      const auto & candidate = candidates[selected_index];
+      const auto & points = candidate.solved_armor.points;
+      const auto id = candidate.model_id;
+      if (id < 0 || static_cast<std::size_t>(id) >= predicted_armors.size() ||
+          points.size() != 4) {
+        continue;
+      }
+      full_armor_observed[static_cast<std::size_t>(id)] = true;
+      frame_uvl_bars.push_back({points[0], points[3], id, true});
+      frame_uvl_bars.push_back({points[1], points[2], id, false});
+    }
+
+    if (single_lightbar_update_enabled_ && lightbars != nullptr && !lightbars->empty()) {
+      struct LightbarMatchEdge
+      {
+        double cost;
+        std::size_t light_index;
+        int armor_id;
+        bool is_left;
+      };
+
+      std::vector<const Lightbar *> raw_lightbars;
+      raw_lightbars.reserve(lightbars->size());
+      for (const auto & lightbar : *lightbars) {
+        if (lightbar.color == enemy_color_) raw_lightbars.push_back(&lightbar);
+      }
+
+      std::vector<LightbarMatchEdge> edges;
+      for (const int id : nearest_ids) {
+        if (id < 0 || static_cast<std::size_t>(id) >= predicted_quads.size() ||
+            full_armor_observed[static_cast<std::size_t>(id)] ||
+            predicted_quads[static_cast<std::size_t>(id)].size() != 4) {
+          continue;
+        }
+        const auto & quad = predicted_quads[static_cast<std::size_t>(id)];
+        for (const bool is_left : {true, false}) {
+          const std::size_t top_index = is_left ? 0 : 1;
+          const std::size_t bottom_index = is_left ? 3 : 2;
+          const auto & predicted_top = quad[top_index];
+          const auto & predicted_bottom = quad[bottom_index];
+          const double predicted_length = cv::norm(predicted_top - predicted_bottom);
+          if (!std::isfinite(predicted_length) || predicted_length <= 1e-3) continue;
+          const double predicted_angle = std::atan2(
+            predicted_top.x - predicted_bottom.x, predicted_top.y - predicted_bottom.y);
+
+          for (std::size_t light_index = 0; light_index < raw_lightbars.size(); ++light_index) {
+            const auto & lightbar = *raw_lightbars[light_index];
+            const double observed_length = cv::norm(lightbar.top - lightbar.bottom);
+            if (!std::isfinite(observed_length) || observed_length <= 1e-3 ||
+                !std::isfinite(lightbar.top.x) || !std::isfinite(lightbar.top.y) ||
+                !std::isfinite(lightbar.bottom.x) || !std::isfinite(lightbar.bottom.y)) {
+              continue;
+            }
+            const double length_error = std::abs(observed_length - predicted_length);
+            if (length_error > predicted_length * lightbar_match_length_ratio_gate_) continue;
+            const double observed_angle = std::atan2(
+              lightbar.top.x - lightbar.bottom.x, lightbar.top.y - lightbar.bottom.y);
+            const double angle_error = std::abs(tools::limit_rad(observed_angle - predicted_angle));
+            if (angle_error > lightbar_match_angle_gate_rad_) continue;
+            const double endpoint_error = cv::norm(lightbar.top - predicted_top) +
+              cv::norm(lightbar.bottom - predicted_bottom);
+            if (endpoint_error > predicted_length * lightbar_match_position_ratio_gate_) continue;
+
+            const double cost = endpoint_error / predicted_length +
+              length_error / predicted_length + angle_error / lightbar_match_angle_gate_rad_;
+            edges.push_back({cost, light_index, id, is_left});
+          }
+        }
+      }
+
+      std::stable_sort(edges.begin(), edges.end(), [](const auto & a, const auto & b) {
+        if (a.cost != b.cost) return a.cost < b.cost;
+        if (a.light_index != b.light_index) return a.light_index < b.light_index;
+        if (a.armor_id != b.armor_id) return a.armor_id < b.armor_id;
+        return a.is_left && !b.is_left;
+      });
+      // 按投影误差由小到大一对一贪心分配，防止同一实测灯条被多个模型板重复使用。
+      std::vector<bool> light_used(raw_lightbars.size(), false);
+      std::vector<bool> slot_used(predicted_armors.size() * 2, false);
+      for (std::size_t id = 0; id < full_armor_observed.size(); ++id) {
+        if (full_armor_observed[id]) {
+          slot_used[id * 2] = true;
+          slot_used[id * 2 + 1] = true;
+        }
+      }
+      for (const auto & edge : edges) {
+        const std::size_t slot = static_cast<std::size_t>(edge.armor_id) * 2 +
+          (edge.is_left ? 0 : 1);
+        if (light_used[edge.light_index] || slot_used[slot]) continue;
+        const auto & lightbar = *raw_lightbars[edge.light_index];
+        frame_uvl_bars.push_back({lightbar.top, lightbar.bottom, edge.armor_id, edge.is_left});
+        light_used[edge.light_index] = true;
+        slot_used[slot] = true;
+      }
+    }
+
+    const auto max_abs_angular_velocity = geometry_branch_ == "standard_four"
+      ? standard_max_angular_velocity_ : std::optional<double>{};
+    if (!frame_uvl_bars.empty()) {
+      // 整板角点与独立灯条共用同一先验做多因子更新，避免重复收缩协方差。
+      frame_uvl_accepted = target_.update_uvl_bars(
+        frame_uvl_bars, solver_, uvl_iteration_num_, max_abs_angular_velocity,
+        association_update_trace_enabled_ ? &frame_uvl_trace : nullptr);
+    }
+  }
+
+  bool found = uvl_mode && selected_indices.empty() && frame_uvl_accepted;
+  if (found) observation_accepted_ = true;
   for (const auto selected_index : selected_indices) {
     auto & candidate = candidates[selected_index];
     EndpointRangeShadowDebug * endpoint_shadow = nullptr;
@@ -1097,7 +1525,7 @@ bool Tracker::update_target(
     }
     std::optional<Armor> shadow_measurement;
     const Armor * measurement = &candidate.solved_armor;
-    if (endpoint_shadow != nullptr) {
+    if (!uvl_mode && endpoint_shadow != nullptr) {
       endpoint_shadow->selected = true;
       endpoint_shadow->selected_raw_distance_m = candidate.solved_armor.ypd_in_world[2];
       if (endpoint_shadow->reliable) {
@@ -1134,7 +1562,7 @@ bool Tracker::update_target(
     double quality_scale = 1.0;
     double quality_ms = 0.0;
     std::optional<double> distance_variance_override;
-    if (distance_quality_enabled_) {
+    if (distance_quality_enabled_ && !uvl_mode) {
         const auto start = std::chrono::steady_clock::now();
         distance_quality = estimate_distance_quality(
             candidate.solved_armor, predicted_armors[candidate.model_id][3],
@@ -1153,12 +1581,17 @@ bool Tracker::update_target(
             std::chrono::steady_clock::now() - start).count();
     }
     TargetUpdateTrace target_update_trace;
-    const bool accepted = target_.update(
-      *measurement, candidate.model_id, std::nullopt,
-      max_abs_angular_velocity, measurement_noise_reference,
-      distance_update_r_scale_ * quality_scale,
-      association_update_trace_enabled_ ? &target_update_trace : nullptr,
-      yaw_update_sigma_deg_, distance_variance_override);
+    bool accepted = frame_uvl_accepted;
+    if (uvl_mode) {
+      target_update_trace = frame_uvl_trace;
+    } else {
+      accepted = target_.update(
+        *measurement, candidate.model_id, std::nullopt,
+        max_abs_angular_velocity, measurement_noise_reference,
+        distance_update_r_scale_ * quality_scale,
+        association_update_trace_enabled_ ? &target_update_trace : nullptr,
+        yaw_update_sigma_deg_, distance_variance_override);
+    }
     candidate.debug.accepted = accepted;
     if (association_update_trace_enabled_) {
       AssociationUpdateDebug update_debug;
@@ -1217,7 +1650,11 @@ bool Tracker::update_target(
     observation_accepted_ = true;
     ++association_debug_.accepted_count;
     *candidate.source_armor = candidate.solved_armor;
-    if (geometry_branch_ == "standard_four") ++successful_capture_updates_;
+    if (!uvl_mode && geometry_branch_ == "standard_four") ++successful_capture_updates_;
+  }
+
+  if (uvl_mode && found && geometry_branch_ == "standard_four") {
+    ++successful_capture_updates_;
   }
 
   if (association_update_trace_enabled_) {

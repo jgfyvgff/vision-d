@@ -184,6 +184,12 @@ public:
     bool use_enemy_color = true,
     EndpointRangeShadowMap * endpoint_range_shadow = nullptr);
 
+  // 将同帧独立灯条作为额外输入；只有已初始化的目标会使用这些观测更新。
+  std::list<Target> track(
+    std::list<Armor> & armors, const std::list<Lightbar> & lightbars,
+    std::chrono::steady_clock::time_point t, bool use_enemy_color = true,
+    EndpointRangeShadowMap * endpoint_range_shadow = nullptr);
+
   std::tuple<omniperception::DetectionResult, std::list<Target>> track(
     const std::vector<omniperception::DetectionResult> & detection_queue, std::list<Armor> & armors,
     std::chrono::steady_clock::time_point t, bool use_enemy_color = true);
@@ -197,10 +203,10 @@ private:
   int temp_lost_count_;
   int outpost_max_temp_lost_count_;
   int normal_temp_lost_count_;
-  // 非标准模型完整 P0 对角线，顺序为 [x,vx,y,vy,z,vz,center_yaw,omega,r,l,h]。
-  std::array<double, 11> balance_initial_covariance_diagonal_;
-  std::array<double, 11> outpost_initial_covariance_diagonal_;
-  std::array<double, 11> base_initial_covariance_diagonal_;
+  // P0 顺序与 Target 13 维状态一致；姿态为 SO(3) 局部误差方差，单位 rad²。
+  std::array<double, 13> balance_initial_covariance_diagonal_;
+  std::array<double, 13> outpost_initial_covariance_diagonal_;
+  std::array<double, 13> base_initial_covariance_diagonal_;
   // 标准四装甲机器人的已知几何先验；方差单位为 m²。
   bool standard_geometry_constraint_;
   bool standard_radius_delta_constraint_;
@@ -214,6 +220,8 @@ private:
   double standard_height_delta_variance_;
   double standard_initial_position_variance_;
   double standard_initial_center_yaw_variance_;
+  // 新增 SO(3) roll/pitch 局部误差的初始方差，单位 rad²。
+  double standard_initial_tilt_variance_;
   // 标准四装甲捕获时的平移速度初始方差，单位 m²/s²。
   double standard_initial_velocity_variance_;
   // 标准四装甲捕获时的角速度初始方差，单位 (rad/s)²。
@@ -260,6 +268,24 @@ private:
   double measurement_distance_variance_offset_;
   double measurement_armor_yaw_variance_log_scale_;
   double measurement_armor_yaw_variance_offset_;
+  double measurement_armor_tilt_variance_;
+  // UVL 为首选图像观测；pnp_ypd 保留旧更新路径，供离线回放对照。
+  std::string observation_model_ = "uvl";
+  int uvl_iteration_num_ = 5;
+  Eigen::Vector3d qxyz_common_{30.0, 30.0, 1.0};
+  Eigen::Vector3d qxyz_output_{1.0, 1.0, 1.0};
+  double qyaw_common_ = 30.0;
+  double qyaw_output_ = 0.01;
+  double q_radius_ = 1e-7;
+  double q_height_ = 1e-7;
+  double q_wpr_ = 0.1;
+  double uvl_sigma_angle_ = 0.1;
+  double uvl_sigma_px_by_length_ratio_ = 0.2;
+  double uvl_sigma_length_by_length_ratio_ = 0.3;
+  bool single_lightbar_update_enabled_ = true;
+  double lightbar_match_length_ratio_gate_ = 0.2;
+  double lightbar_match_angle_gate_rad_ = 0.2;
+  double lightbar_match_position_ratio_gate_ = 5.0;
   // 最大可信预测间隔，单位为 s；短时抖动由 EKF 使用真实 dt 吸收。
   double max_prediction_gap_;
   std::string state_, pre_state_;
@@ -276,12 +302,26 @@ private:
   std::uint64_t target_generation_ = 0;
   // set_target 的首帧只初始化状态；仅累计其后的成功关联更新。
   int successful_capture_updates_ = 0;
+  // 只保留一个独立候选整车；主目标进入短时丢失后，候选达到连续观测门限才接管。
+  bool candidate_valid_ = false;
+  Target candidate_target_;
+  int candidate_detect_count_ = 0;
+  int candidate_temp_lost_count_ = 0;
+  std::string candidate_geometry_branch_ = "none";
+  double candidate_separation_min_m_ = 0.65;
+  std::chrono::steady_clock::time_point candidate_last_timestamp_{};
   // 捕获阶段的类别投票窗口；只在还没进入 tracking 时用于改判类别。
   int relock_name_window_;
   int relock_name_votes_;
   std::deque<ArmorName> recent_names_;
 
   void state_machine(bool found);
+  void configure_observation_model(Target & target) const;
+
+  void update_candidate_target(
+    std::list<Armor> & armors, std::chrono::steady_clock::time_point t,
+    bool use_enemy_color, bool allow_new_candidate);
+  bool promote_candidate_if_ready();
 
   void push_recent_name(std::optional<ArmorName> name);
 
@@ -294,7 +334,8 @@ private:
   bool update_target(
     std::list<Armor> & armors, std::chrono::steady_clock::time_point t,
     std::optional<NameVote> relabel_vote = std::nullopt,
-    EndpointRangeShadowMap * endpoint_range_shadow = nullptr);
+    EndpointRangeShadowMap * endpoint_range_shadow = nullptr,
+    const std::list<Lightbar> * lightbars = nullptr);
 };
 
 }  // namespace auto_aim
