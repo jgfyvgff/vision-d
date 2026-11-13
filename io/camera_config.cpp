@@ -2,6 +2,7 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <cmath>
 #include <stdexcept>
 #include <unordered_set>
 #include <utility>
@@ -19,6 +20,15 @@ T required(const YAML::Node & node, const std::string & key, const std::string &
     throw std::runtime_error("Camera '" + role + "' is missing '" + key + "'");
   }
   return node[key].as<T>();
+}
+
+double frame_rate(const YAML::Node & node, const std::string & role, double fallback)
+{
+  const double value = node["frame_rate_fps"] ? node["frame_rate_fps"].as<double>() : fallback;
+  if (!std::isfinite(value) || value <= 0) {
+    throw std::runtime_error("Camera '" + role + "' frame_rate_fps must be finite and positive");
+  }
+  return value;
 }
 }  // namespace
 
@@ -54,6 +64,21 @@ std::vector<CameraConfig> load_camera_configs(const std::string & config_path)
       camera.device = required<std::string>(node, "device", camera.role);
       camera.fov_h_deg = required<double>(node, "fov_h_deg", camera.role);
       camera.fov_v_deg = required<double>(node, "fov_v_deg", camera.role);
+      const double legacy_frame_rate = node["frame_rate_fps"] ?
+        node["frame_rate_fps"].as<double>() : tools::read<double>(yaml, "usb_frame_rate");
+      camera.frame_rate_fps = frame_rate(node, camera.role, legacy_frame_rate);
+      camera.usb_exposure = node["usb_exposure"] ? node["usb_exposure"].as<double>() :
+        tools::read<double>(yaml, "usb_exposure");
+      camera.usb_gain = node["usb_gain"] ? node["usb_gain"].as<double>() :
+        tools::read<double>(yaml, "usb_gain");
+      camera.usb_gamma = node["usb_gamma"] ? node["usb_gamma"].as<double>() :
+        tools::read<double>(yaml, "usb_gamma");
+      if (!std::isfinite(camera.usb_exposure) || camera.usb_exposure <= 0 ||
+          !std::isfinite(camera.usb_gain) || camera.usb_gain < 0 ||
+          !std::isfinite(camera.usb_gamma) || camera.usb_gamma < 0) {
+        throw std::runtime_error(
+          "Camera '" + camera.role + "' UVC exposure must be positive and gain/gamma non-negative");
+      }
       if (camera.fov_h_deg <= 0 || camera.fov_v_deg <= 0) {
         throw std::runtime_error("Camera '" + camera.role + "' must have a positive FOV");
       }
@@ -61,6 +86,8 @@ std::vector<CameraConfig> load_camera_configs(const std::string & config_path)
       camera.vid_pid = required<std::string>(node, "vid_pid", camera.role);
       camera.exposure_ms = required<double>(node, "exposure_ms", camera.role);
       camera.gain = required<double>(node, "gain", camera.role);
+      camera.frame_rate_fps = frame_rate(
+        node, camera.role, kDefaultHikRobotFrameRateFps);
     } else if (camera.type == "mindvision") {
       camera.vid_pid = required<std::string>(node, "vid_pid", camera.role);
       camera.exposure_ms = required<double>(node, "exposure_ms", camera.role);

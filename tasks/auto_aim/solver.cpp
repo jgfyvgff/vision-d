@@ -2,6 +2,10 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <stdexcept>
 #include <vector>
 
 #include "tools/logger.hpp"
@@ -9,58 +13,210 @@
 
 namespace auto_aim
 {
-constexpr double LIGHTBAR_LENGTH = 56e-3;     // m
+constexpr double DEFAULT_LIGHTBAR_LENGTH = 56e-3;  // m
 constexpr double BIG_ARMOR_WIDTH = 230e-3;    // m
 constexpr double SMALL_ARMOR_WIDTH = 135e-3;  // m
 
-const std::vector<cv::Point3f> BIG_ARMOR_POINTS{
-  {0, BIG_ARMOR_WIDTH / 2, LIGHTBAR_LENGTH / 2},
-  {0, -BIG_ARMOR_WIDTH / 2, LIGHTBAR_LENGTH / 2},
-  {0, -BIG_ARMOR_WIDTH / 2, -LIGHTBAR_LENGTH / 2},
-  {0, BIG_ARMOR_WIDTH / 2, -LIGHTBAR_LENGTH / 2}};
-const std::vector<cv::Point3f> SMALL_ARMOR_POINTS{
-  {0, SMALL_ARMOR_WIDTH / 2, LIGHTBAR_LENGTH / 2},
-  {0, -SMALL_ARMOR_WIDTH / 2, LIGHTBAR_LENGTH / 2},
-  {0, -SMALL_ARMOR_WIDTH / 2, -LIGHTBAR_LENGTH / 2},
-  {0, SMALL_ARMOR_WIDTH / 2, -LIGHTBAR_LENGTH / 2}};
-
-Solver::Solver(const std::string & config_path) : R_gimbal2world_(Eigen::Matrix3d::Identity())
+Solver::Solver(const std::string & config_path)
+: R_gimbal2world_(Eigen::Matrix3d::Identity()), lightbar_length_(DEFAULT_LIGHTBAR_LENGTH)
 {
   auto yaml = YAML::LoadFile(config_path);
 
-  auto R_gimbal2imubody_data = yaml["R_gimbal2imubody"].as<std::vector<double>>();
-  auto R_camera2gimbal_data = yaml["R_camera2gimbal"].as<std::vector<double>>();
-  auto t_camera2gimbal_data = yaml["t_camera2gimbal"].as<std::vector<double>>();
-  R_gimbal2imubody_ = Eigen::Matrix<double, 3, 3, Eigen::RowMajor>(R_gimbal2imubody_data.data());
-  R_camera2gimbal_ = Eigen::Matrix<double, 3, 3, Eigen::RowMajor>(R_camera2gimbal_data.data());
-  t_camera2gimbal_ = Eigen::Matrix<double, 3, 1>(t_camera2gimbal_data.data());
+  if (yaml["pnp_lightbar_length"].IsDefined()) {
+    lightbar_length_ = yaml["pnp_lightbar_length"].as<double>();
+  }
+  if (
+    !std::isfinite(lightbar_length_) || lightbar_length_ < 0.02 ||
+    lightbar_length_ > 0.10)
+  {
+    throw std::runtime_error("Invalid pnp_lightbar_length configuration");
+  }
+
+  // 物点顺序必须与检测器输出的四个角点顺序一致；这里只参数化灯条长度，
+  // 不改变装甲板宽度和点序，避免不同配置产生难以追踪的 PnP 分支差异。
+  big_armor_points_ = {
+    {0, BIG_ARMOR_WIDTH / 2, static_cast<float>(lightbar_length_ / 2)},
+    {0, -BIG_ARMOR_WIDTH / 2, static_cast<float>(lightbar_length_ / 2)},
+    {0, -BIG_ARMOR_WIDTH / 2, static_cast<float>(-lightbar_length_ / 2)},
+    {0, BIG_ARMOR_WIDTH / 2, static_cast<float>(-lightbar_length_ / 2)}};
+
+  small_armor_points_ = {
+    {0, SMALL_ARMOR_WIDTH / 2, static_cast<float>(lightbar_length_ / 2)},
+    {0, -SMALL_ARMOR_WIDTH / 2, static_cast<float>(lightbar_length_ / 2)},
+    {0, -SMALL_ARMOR_WIDTH / 2, static_cast<float>(-lightbar_length_ / 2)},
+    {0, SMALL_ARMOR_WIDTH / 2, static_cast<float>(-lightbar_length_ / 2)}};
+
+  auto R_gimbal2imubody_data = yaml["R_gimbal2imubody"].as<std::vector<double>>();//gimbal坐标系到imu坐标系的旋转矩阵
+  auto R_camera2gimbal_data = yaml["R_camera2gimbal"].as<std::vector<double>>();//camera坐标系到gimbal坐标系的旋转矩阵
+  auto t_camera2gimbal_data = yaml["t_camera2gimbal"].as<std::vector<double>>();//camera坐标系到gimbal坐标系的平移向量
+  R_gimbal2imubody_ = Eigen::Matrix<double, 3, 3, Eigen::RowMajor>(R_gimbal2imubody_data.data());//将旋转矩阵转换为Eigen矩阵
+  R_camera2gimbal_ = Eigen::Matrix<double, 3, 3, Eigen::RowMajor>(R_camera2gimbal_data.data());//将旋转矩阵转换为Eigen矩阵
+  t_camera2gimbal_ = Eigen::Matrix<double, 3, 1>(t_camera2gimbal_data.data());//将平移向量转换为Eigen矩阵
 
   auto camera_matrix_data = yaml["camera_matrix"].as<std::vector<double>>();
   auto distort_coeffs_data = yaml["distort_coeffs"].as<std::vector<double>>();
   Eigen::Matrix<double, 3, 3, Eigen::RowMajor> camera_matrix(camera_matrix_data.data());
   Eigen::Matrix<double, 1, 5> distort_coeffs(distort_coeffs_data.data());
-  cv::eigen2cv(camera_matrix, camera_matrix_);
-  cv::eigen2cv(distort_coeffs, distort_coeffs_);
+  cv::eigen2cv(camera_matrix, camera_matrix_);//将Eigen矩阵转换为cv::Mat
+  cv::eigen2cv(distort_coeffs, distort_coeffs_);//将Eigen矩阵转换为cv::Mat
+
+  max_yaw_optimization_correction_ = yaml["max_yaw_optimization_correction"].IsDefined()
+                                       ? yaml["max_yaw_optimization_correction"].as<double>()
+                                       : std::numeric_limits<double>::infinity();
+  yaw_optimization_enabled_ = yaml["yaw_optimization_enabled"].IsDefined()
+                                ? yaml["yaw_optimization_enabled"].as<bool>()
+                                : true;
+  if (
+    !std::isinf(max_yaw_optimization_correction_) &&
+    (!std::isfinite(max_yaw_optimization_correction_) ||
+     max_yaw_optimization_correction_ <= 0.0 ||
+     max_yaw_optimization_correction_ > CV_PI))
+  {
+    throw std::runtime_error("Invalid max_yaw_optimization_correction configuration");
+  }
+}
+
+const std::vector<cv::Point3f> & Solver::armor_points(ArmorType type) const
+{
+  return type == ArmorType::big ? big_armor_points_ : small_armor_points_;
 }
 
 Eigen::Matrix3d Solver::R_gimbal2world() const { return R_gimbal2world_; }
 
 void Solver::set_R_gimbal2world(const Eigen::Quaterniond & q)
 {
-  Eigen::Matrix3d R_imubody2imuabs = q.toRotationMatrix();
+  Eigen::Matrix3d R_imubody2imuabs = q.toRotationMatrix();//将四元数转换为旋转矩阵，表示imu坐标系到imu绝对坐标系的旋转
   R_gimbal2world_ = R_gimbal2imubody_.transpose() * R_imubody2imuabs * R_gimbal2imubody_;
 }
 
-//solvePnP（获得姿态）
-void Solver::solve(Armor & armor) const
+void Solver::set_gimbal_to_world(const Eigen::Quaterniond & q)
 {
-  const auto & object_points =
-    (armor.type == ArmorType::big) ? BIG_ARMOR_POINTS : SMALL_ARMOR_POINTS;
+    if (!q.coeffs().allFinite() || std::abs(q.norm() - 1.0) > 0.01) {
+        throw std::invalid_argument("Invalid gimbal-to-world quaternion");
+    }
+    R_gimbal2world_ = q.normalized().toRotationMatrix();
+}
 
-  cv::Vec3d rvec, tvec;
-  cv::solvePnP(
-    object_points, armor.points, camera_matrix_, distort_coeffs_, rvec, tvec, false,
+std::vector<PnpCandidateDebug> Solver::pnp_candidates(const Armor & armor) const
+{
+  if (armor.points.size() != 4) {
+    return {};
+  }
+
+  const auto & object_points = armor_points(armor.type);
+
+  std::vector<cv::Mat> rvecs;
+  std::vector<cv::Mat> tvecs;
+  const bool solved = cv::solvePnPGeneric(
+    object_points,
+    armor.points,
+    camera_matrix_,
+    distort_coeffs_,
+    rvecs,
+    tvecs,
+    false,
     cv::SOLVEPNP_IPPE);
+  if (!solved || rvecs.empty() || rvecs.size() != tvecs.size()) {
+    return {};
+  }
+
+  std::vector<PnpCandidateDebug> candidates;
+  candidates.reserve(rvecs.size());
+  for (std::size_t i = 0; i < rvecs.size(); ++i) {
+    cv::Mat rotation_matrix;
+    cv::Rodrigues(rvecs[i], rotation_matrix);
+
+    Eigen::Matrix3d R_armor2camera;
+    Eigen::Vector3d xyz_in_camera;
+    cv::cv2eigen(rotation_matrix, R_armor2camera);
+    cv::cv2eigen(tvecs[i], xyz_in_camera);
+
+    const Eigen::Vector3d xyz_in_gimbal =
+      R_camera2gimbal_ * xyz_in_camera + t_camera2gimbal_;
+    const Eigen::Vector3d xyz_in_world =
+      R_gimbal2world_ * xyz_in_gimbal;
+    const Eigen::Matrix3d R_armor2world =
+      R_gimbal2world_ * R_camera2gimbal_ * R_armor2camera;
+
+    std::vector<cv::Point2f> projected_points;
+    cv::projectPoints(
+      object_points,
+      rvecs[i],
+      tvecs[i],
+      camera_matrix_,
+      distort_coeffs_,
+      projected_points);
+
+    double reprojection_error = 0.0;
+    for (std::size_t point_id = 0; point_id < armor.points.size(); ++point_id) {
+      reprojection_error +=
+        cv::norm(armor.points[point_id] - projected_points[point_id]);
+    }
+    reprojection_error /= static_cast<double>(armor.points.size());
+
+    PnpCandidateDebug candidate;
+    candidate.yaw_in_world = tools::eulers(R_armor2world, 2, 1, 0)[0];
+    candidate.reprojection_error = reprojection_error;
+    candidate.xyz_in_camera = xyz_in_camera;
+    candidate.xyz_in_world = xyz_in_world;
+    candidate.R_armor2world = R_armor2world;
+    candidates.push_back(candidate);
+  }
+  return candidates;
+}
+
+//solvePnP（获得姿态）
+void Solver::solve(
+  Armor & armor, std::optional<Eigen::Vector4d> predicted_armor) const
+{
+  const auto & object_points = armor_points(armor.type);
+
+  cv::Mat rvec, tvec;
+  if (!predicted_armor.has_value()) {
+    cv::solvePnP(
+      object_points, armor.points, camera_matrix_, distort_coeffs_, rvec, tvec, false,
+      cv::SOLVEPNP_IPPE);
+  } else {
+    std::vector<cv::Mat> candidate_rvecs;
+    std::vector<cv::Mat> candidate_tvecs;
+    const bool solved = cv::solvePnPGeneric(
+      object_points,
+      armor.points,
+      camera_matrix_,
+      distort_coeffs_,
+      candidate_rvecs,
+      candidate_tvecs,
+      false,
+      cv::SOLVEPNP_IPPE);
+
+    if (!solved || candidate_rvecs.empty() ||
+        candidate_rvecs.size() != candidate_tvecs.size()) {
+      cv::solvePnP(
+        object_points, armor.points, camera_matrix_, distort_coeffs_, rvec, tvec, false,
+        cv::SOLVEPNP_IPPE);
+    } else {
+      std::size_t selected_index = 0;
+      auto selected_error = std::numeric_limits<double>::infinity();
+      for (std::size_t i = 0; i < candidate_rvecs.size(); ++i) {
+        cv::Mat candidate_rotation;
+        cv::Rodrigues(candidate_rvecs[i], candidate_rotation);
+        Eigen::Matrix3d R_armor2camera;
+        cv::cv2eigen(candidate_rotation, R_armor2camera);
+
+        const auto R_armor2world =
+          R_gimbal2world_ * R_camera2gimbal_ * R_armor2camera;
+        const auto candidate_yaw = tools::eulers(R_armor2world, 2, 1, 0)[0];
+        const auto yaw_error = std::abs(tools::limit_rad(
+          candidate_yaw - (*predicted_armor)[3]));
+        if (yaw_error < selected_error) {
+          selected_error = yaw_error;
+          selected_index = i;
+        }
+      }
+      rvec = candidate_rvecs[selected_index];
+      tvec = candidate_tvecs[selected_index];
+    }
+  }
 
   Eigen::Vector3d xyz_in_camera;
   cv::cv2eigen(tvec, xyz_in_camera);
@@ -68,23 +224,53 @@ void Solver::solve(Armor & armor) const
   armor.xyz_in_world = R_gimbal2world_ * armor.xyz_in_gimbal;
 
   cv::Mat rmat;
-  cv::Rodrigues(rvec, rmat);
+  cv::Rodrigues(rvec, rmat);//将旋转向量转换为旋转矩阵
   Eigen::Matrix3d R_armor2camera;
-  cv::cv2eigen(rmat, R_armor2camera);
+  cv::cv2eigen(rmat, R_armor2camera);//将旋转矩阵转换为Eigen矩阵
   Eigen::Matrix3d R_armor2gimbal = R_camera2gimbal_ * R_armor2camera;
   Eigen::Matrix3d R_armor2world = R_gimbal2world_ * R_armor2gimbal;
-  armor.ypr_in_gimbal = tools::eulers(R_armor2gimbal, 2, 1, 0);
-  armor.ypr_in_world = tools::eulers(R_armor2world, 2, 1, 0);
+  armor.ypr_in_gimbal = tools::eulers(R_armor2gimbal, 2, 1, 0);//将旋转矩阵转换为欧拉角
+  armor.ypr_in_world = tools::eulers(R_armor2world, 2, 1, 0);//将旋转矩阵转换为欧拉角
 
-  armor.ypd_in_world = tools::xyz2ypd(armor.xyz_in_world);
+  armor.ypd_in_world = tools::xyz2ypd(armor.xyz_in_world);//转换为平面坐标系下的yaw、pitch、distance
 
   // 平衡不做yaw优化，因为pitch假设不成立
   auto is_balance = (armor.type == ArmorType::big) &&
                     (armor.name == ArmorName::three || armor.name == ArmorName::four ||
-                     armor.name == ArmorName::five);
+                     armor.name == ArmorName::five);//判断是否为平衡步兵
   if (is_balance) return;
 
-  optimize_yaw(armor);
+  if (!yaw_optimization_enabled_) {
+    // PnP 已用完整姿态拟合角点；不要再用零滚转的简化模型改写倒装相机的 yaw。
+    armor.yaw_raw = armor.ypr_in_world[0];
+    return;
+  }
+
+  const auto reference_yaw =
+    predicted_armor ? std::optional<double>((*predicted_armor)[3]) : std::nullopt;
+  optimize_yaw(armor, reference_yaw);
+}
+
+std::vector<cv::Point2f> Solver::reproject_pnp(const Armor & armor) const
+{
+  if (armor.points.size() != 4) {
+    return {};
+  }
+
+  const auto & object_points = armor_points(armor.type);
+
+  cv::Vec3d rvec, tvec;
+  const bool solved = cv::solvePnP(
+    object_points, armor.points, camera_matrix_, distort_coeffs_, rvec, tvec, false,
+    cv::SOLVEPNP_IPPE);
+  if (!solved) {
+    return {};
+  }
+
+  std::vector<cv::Point2f> image_points;
+  cv::projectPoints(
+    object_points, rvec, tvec, camera_matrix_, distort_coeffs_, image_points);
+  return image_points;
 }
 
 std::vector<cv::Point2f> Solver::reproject_armor(
@@ -93,7 +279,7 @@ std::vector<cv::Point2f> Solver::reproject_armor(
   auto sin_yaw = std::sin(yaw);
   auto cos_yaw = std::cos(yaw);
 
-  auto pitch = (name == ArmorName::outpost) ? -15.0 * CV_PI / 180.0 : 15.0 * CV_PI / 180.0;
+  auto pitch = (name == ArmorName::outpost) ? -15.0 * CV_PI / 180.0 : 15.0 * CV_PI / 180.0;//
   auto sin_pitch = std::sin(pitch);
   auto cos_pitch = std::cos(pitch);
 
@@ -121,16 +307,41 @@ std::vector<cv::Point2f> Solver::reproject_armor(
 
   // reproject
   std::vector<cv::Point2f> image_points;
-  const auto & object_points = (type == ArmorType::big) ? BIG_ARMOR_POINTS : SMALL_ARMOR_POINTS;
+  const auto & object_points = armor_points(type);
   cv::projectPoints(object_points, rvec, tvec, camera_matrix_, distort_coeffs_, image_points);
+  return image_points;
+}//重投影装甲板的四个角点到图像平面上，返回图像坐标系下的四个点
+
+std::vector<cv::Point2f> Solver::reproject_armor_pose(
+  const Eigen::Vector3d & xyz_in_world,
+  const Eigen::Matrix3d & R_armor2world,
+  ArmorType type) const
+{
+  // 这里直接使用 TF 的完整姿态，避免用固定俯仰角或仅 yaw 重建真值角点，
+  // 从而把姿态误差、角点点序和 PnP 尺寸误差分开观察。
+  const Eigen::Matrix3d R_armor2camera =
+    R_camera2gimbal_.transpose() * R_gimbal2world_.transpose() * R_armor2world;
+  const Eigen::Vector3d t_armor2camera =
+    R_camera2gimbal_.transpose() *
+    (R_gimbal2world_.transpose() * xyz_in_world - t_camera2gimbal_);
+
+  cv::Vec3d rvec;
+  cv::Mat R_armor2camera_cv;
+  cv::eigen2cv(R_armor2camera, R_armor2camera_cv);
+  cv::Rodrigues(R_armor2camera_cv, rvec);
+  const cv::Vec3d tvec(
+    t_armor2camera[0], t_armor2camera[1], t_armor2camera[2]);
+
+  std::vector<cv::Point2f> image_points;
+  cv::projectPoints(
+    armor_points(type), rvec, tvec, camera_matrix_, distort_coeffs_, image_points);
   return image_points;
 }
 
 double Solver::oupost_reprojection_error(Armor armor, const double & pitch)
 {
   // solve
-  const auto & object_points =
-    (armor.type == ArmorType::big) ? BIG_ARMOR_POINTS : SMALL_ARMOR_POINTS;
+  const auto & object_points = armor_points(armor.type);
 
   cv::Vec3d rvec, tvec;
   cv::solvePnP(
@@ -193,7 +404,8 @@ double Solver::oupost_reprojection_error(Armor armor, const double & pitch)
   return error;
 }
 
-void Solver::optimize_yaw(Armor & armor) const
+void Solver::optimize_yaw(
+  Armor & armor, std::optional<double> reference_yaw) const
 {
   Eigen::Vector3d gimbal_ypr = tools::eulers(R_gimbal2world_, 2, 1, 0);
 
@@ -213,8 +425,22 @@ void Solver::optimize_yaw(Armor & armor) const
     }
   }
 
-  armor.yaw_raw = armor.ypr_in_world[0];
-  armor.ypr_in_world[0] = best_yaw;
+  armor.yaw_raw = armor.ypr_in_world[0];//把原始yaw赋值给armor.yaw_raw
+  const auto correction = std::abs(tools::limit_rad(best_yaw - armor.yaw_raw));
+  const auto raw_reference_error = reference_yaw
+    ? std::abs(tools::limit_rad(armor.yaw_raw - *reference_yaw))
+    : std::numeric_limits<double>::infinity();
+  const auto optimized_reference_error = reference_yaw
+    ? std::abs(tools::limit_rad(best_yaw - *reference_yaw))
+    : 0.0;
+  const auto preserves_prediction_continuity =
+    optimized_reference_error <= raw_reference_error;
+  // 仿真中的矩形对称性可能让重投影优化落入约 ±90° 的错误分支。
+  // 修正量异常时保留原始 PnP yaw，避免车辆中心和装甲板模型 ID 被整体旋错。
+  armor.ypr_in_world[0] =
+    correction <= max_yaw_optimization_correction_ && preserves_prediction_continuity
+      ? best_yaw
+      : armor.yaw_raw;
 }
 
 double Solver::SJTU_cost(

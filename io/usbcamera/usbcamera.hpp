@@ -34,10 +34,11 @@ private:
   cv::Mat img_;
   std::string open_name_;
   std::string configured_role_;
-  int usb_exposure_, usb_frame_rate_, sharpness_;
+  double usb_exposure_, usb_frame_rate_;
+  int sharpness_;
   int open_count_;
   double image_width_, image_height_;
-  int usb_gamma_, usb_gain_;
+  double usb_gamma_, usb_gain_;
   std::atomic_bool quit_, ok_;
   std::thread capture_thread_;
   std::thread daemon_thread_;

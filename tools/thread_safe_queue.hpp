@@ -1,11 +1,13 @@
 #ifndef TOOLS__THREAD_SAFE_QUEUE_HPP
 #define TOOLS__THREAD_SAFE_QUEUE_HPP
 
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <iostream>
 #include <mutex>
 #include <queue>
+#include <utility>
 
 namespace tools
 {
@@ -49,6 +51,19 @@ public:
 
     value = queue_.front();
     queue_.pop();
+  }
+
+  // 采集线程退出时不能无限等待相机帧，因此提供带超时的队列读取。
+  template <typename Rep, typename Period>
+  bool pop_for(T & value, const std::chrono::duration<Rep, Period> & timeout)
+  {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!not_empty_condition_.wait_for(lock, timeout, [this] { return !queue_.empty(); })) {
+      return false;
+    }
+    value = std::move(queue_.front());
+    queue_.pop();
+    return true;
   }
 
   T pop()

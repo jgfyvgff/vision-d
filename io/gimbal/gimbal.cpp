@@ -129,7 +129,7 @@ Eigen::Quaterniond Gimbal::q(std::chrono::steady_clock::time_point t)
   }
 }
 
-void Gimbal::send(io::VisionToGimbal VisionToGimbal)
+bool Gimbal::send(io::VisionToGimbal VisionToGimbal)
 {
   tx_data_.mode = VisionToGimbal.mode;
   tx_data_.yaw = VisionToGimbal.yaw;
@@ -155,13 +155,26 @@ void Gimbal::send(io::VisionToGimbal VisionToGimbal)
   append_value(packet, shoot_command);
 
   try {
-    serial_.write(packet.data(), packet.size());
+    const auto written = serial_.write(packet.data(), packet.size());
+    if (written != packet.size()) {
+      tools::logger()->warn("[Gimbal] Partial serial write: {}/{} bytes", written, packet.size());
+      return false;
+    }
+    GimbalWireEvent event;
+    event.kind = GimbalWireEvent::Kind::TX_TARGET;
+    event.time = std::chrono::steady_clock::now();
+    event.yaw_deg = gimbal_command.yaw;
+    event.pitch_deg = gimbal_command.pitch;
+    event.fire_flag = shoot_command.fire_flag;
+    push_wire_event(event);
+    return true;
   } catch (const std::exception & e) {
     tools::logger()->warn("[Gimbal] Failed to write serial: {}", e.what());
+    return false;
   }
 }
 
-void Gimbal::send(
+bool Gimbal::send(
   bool control, bool fire, float yaw, float yaw_vel, float yaw_acc, float pitch, float pitch_vel,
   float pitch_acc)
 {
@@ -172,7 +185,33 @@ void Gimbal::send(
   tx_data_.pitch = pitch;
   tx_data_.pitch_vel = pitch_vel;
   tx_data_.pitch_acc = pitch_acc;
-  send(tx_data_);
+  return send(tx_data_);
+}
+
+std::vector<GimbalWireEvent> Gimbal::take_wire_events()
+{
+  std::lock_guard<std::mutex> lock(wire_events_mutex_);
+  std::vector<GimbalWireEvent> events(wire_events_.begin(), wire_events_.end());
+  wire_events_.clear();
+  return events;
+}
+
+std::uint64_t Gimbal::dropped_wire_events() const
+{
+  std::lock_guard<std::mutex> lock(wire_events_mutex_);
+  return dropped_wire_events_;
+}
+
+void Gimbal::push_wire_event(GimbalWireEvent event)
+{
+  constexpr std::size_t max_wire_events = 4096;
+  std::lock_guard<std::mutex> lock(wire_events_mutex_);
+  // 磁盘写入或主循环变慢时保留最新反馈；累计丢弃数供 JSONL 标明诊断缺口。
+  if (wire_events_.size() == max_wire_events) {
+    wire_events_.pop_front();
+    ++dropped_wire_events_;
+  }
+  wire_events_.push_back(event);
 }
 
 bool Gimbal::read(uint8_t * buffer, size_t size)
@@ -274,15 +313,18 @@ void Gimbal::handle_packet(
                          Eigen::AngleAxisd(roll, Eigen::Vector3d::UnitX());
   queue_.push({q.normalized(), t});
 
-  std::lock_guard<std::mutex> lock(mutex_);
-  state_.yaw = yaw;
-  state_.yaw_vel = 0;
-  state_.pitch = pitch;
-  state_.pitch_vel = 0;
-  if (has_shoot_data) state_.bullet_speed = shoot_data.bullet_speed;
-  state_.color = gimbal_data.color >= 100 ? 0 : 1;
+  float bullet_speed_mps;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    state_.yaw = yaw;
+    state_.yaw_vel = 0;
+    state_.pitch = pitch;
+    state_.pitch_vel = 0;
+    if (has_shoot_data) state_.bullet_speed = shoot_data.bullet_speed;
+    state_.color = gimbal_data.color >= 100 ? 0 : 1;
+    bullet_speed_mps = state_.bullet_speed;
 
-  switch (gimbal_data.mode) {
+    switch (gimbal_data.mode) {
     case 0:
       mode_ = GimbalMode::AUTO_AIM;
       break;
@@ -300,7 +342,18 @@ void Gimbal::handle_packet(
       auto invalid_mode = gimbal_data.mode;
       tools::logger()->warn("[Gimbal] Invalid mode: {}", invalid_mode);
       break;
+    }
   }
+  GimbalWireEvent event;
+  event.kind = GimbalWireEvent::Kind::RX_FEEDBACK;
+  event.time = std::chrono::steady_clock::now();
+  event.yaw_deg = gimbal_data.yaw;
+  event.pitch_deg = gimbal_data.pitch;
+  event.roll_deg = gimbal_data.roll;
+  event.bullet_speed_mps = bullet_speed_mps;
+  event.mode = gimbal_data.mode;
+  event.color = gimbal_data.color;
+  push_wire_event(event);
 }
 
 void Gimbal::read_thread()

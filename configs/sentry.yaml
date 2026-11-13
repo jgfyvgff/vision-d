@@ -25,9 +25,10 @@ use_roi: false
 image_width: 1280
 image_height: 720
 usb_frame_rate: 60
-usb_exposure: 400 #1-80000______250
+usb_exposure: 40 # V4L2绝对曝光单位100us，即4ms；长曝光会限制可达到的帧率
 usb_gamma: 160
 usb_gain: 10 #0-96
+# cameras 列表中的值可分别覆盖每台设备；以上 USB 值保留为旧配置回退值。
 
 #####-----相机拓扑与方位-----#####
 # UVC角度均相对前向云台坐标系。149度对角FOV按1280x720等距鱼眼模型初估，
@@ -38,6 +39,7 @@ cameras:
     vid_pid: "2bdf:0001"
     exposure_ms: 5
     gain: 16.9
+    frame_rate_fps: 150 # 帧/秒
     yaw_offset_deg: 0
     pitch_offset_deg: 0
 
@@ -48,6 +50,10 @@ cameras:
     pitch_offset_deg: 0
     fov_h_deg: 129.9
     fov_v_deg: 73.1
+    frame_rate_fps: 60 # 请求帧率，单位帧/秒
+    usb_exposure: 40 # 100us单位，即4ms
+    usb_gain: 10 # UVC设备控件刻度
+    usb_gamma: 160 # UVC设备控件刻度
 
   - role: right
     type: uvc
@@ -56,6 +62,10 @@ cameras:
     pitch_offset_deg: 0
     fov_h_deg: 129.9
     fov_v_deg: 73.1
+    frame_rate_fps: 60 # 请求帧率，单位帧/秒
+    usb_exposure: 40 # 100us单位，即4ms
+    usb_gain: 10 # UVC设备控件刻度
+    usb_gamma: 160 # UVC设备控件刻度
 
 #####-----传统方法参数-----#####
 threshold: 150
@@ -72,11 +82,47 @@ min_confidence: 0.8
 #####-----USB云台通信参数-----#####
 com_port: "/dev/serial/by-id/usb-YueLuEmbedded_Vision_Comm_port_206C327D4232-if00"
 gimbal_command_enabled: false # 仅接收下位机状态，不发送云台或发射指令
-
 #####-----tracker参数-----#####
 min_detect_count: 5
 max_temp_lost_count: 25
 outpost_max_temp_lost_count: 75
+
+# Tracker/EKF 参数。P0 对角线顺序：[x,vx,y,vy,z,vz,中心yaw,角速度,r,l,h]。
+# 方差单位依次为 m²、(m/s)²、m²、(m/s)²、m²、(m/s)²、rad²、(rad/s)²、m²、m²、m²。
+balance_radius: 0.2 # m，哨兵旧版双装甲目标半径
+outpost_radius: 0.2765 # m
+base_radius: 0.3205 # m
+standard_radius: 0.2 # m
+balance_initial_covariance_diagonal: [1, 64, 1, 64, 1, 64, 0.4, 100, 1, 1, 1]
+outpost_initial_covariance_diagonal: [1, 64, 1, 64, 1, 81, 0.4, 100, 1e-4, 0, 0]
+base_initial_covariance_diagonal: [1, 64, 1, 64, 1, 64, 0.4, 100, 1e-4, 0, 0]
+standard_initial_position_variance: 1.0 # m²
+standard_initial_velocity_variance: 64.0 # (m/s)²
+standard_initial_center_yaw_variance: 0.4 # rad²
+standard_initial_angular_velocity_variance: 100.0 # (rad/s)²
+standard_radius_variance: 1.0 # m²
+standard_radius_delta_variance: 1.0 # m²
+standard_height_delta_variance: 1.0 # m²
+standard_geometry_constraint: false
+standard_radius_delta_constraint: false
+standard_capture_bootstrap_updates: 0
+standard_translation_acceleration_variance: 100.0 # m²/s⁴
+standard_angular_acceleration_variance: 400.0 # rad²/s⁴
+balance_translation_acceleration_variance: 100.0 # m²/s⁴
+balance_angular_acceleration_variance: 400.0 # rad²/s⁴
+outpost_translation_acceleration_variance: 10.0 # m²/s⁴
+outpost_angular_acceleration_variance: 0.1 # rad²/s⁴
+base_translation_acceleration_variance: 100.0 # m²/s⁴
+base_angular_acceleration_variance: 400.0 # rad²/s⁴
+measurement_bearing_variance: 0.004 # rad²
+measurement_elevation_variance: 0.004 # rad²
+measurement_distance_variance_slope: 1.0 # 距离方差对数项系数，单位 m²
+measurement_distance_variance_offset: 1.0 # m²
+measurement_armor_yaw_variance_slope: 0.005 # 距离对数项系数，单位 rad²
+measurement_armor_yaw_variance_offset: 0.09 # rad²
+distance_update_r_scale: 1.0
+yaw_update_sigma_deg: 0.0 # 0 表示保持配置的基准 yaw 方差
+tracker_max_prediction_gap: 0.1 # s，保持哨兵旧版时间间隔重置边界
 
 #####-----aimer参数-----#####
 yaw_offset: -0.8 # degree -2.5
@@ -86,8 +132,22 @@ leaving_angle: 20 # degree
 left_yaw_offset: -1
 right_yaw_offset: -0.6
 decision_speed: 10 # rad/s
-high_speed_delay_time: 0.026 # s
-low_speed_delay_time: 0.010 # s
+high_speed_delay_time: 0.026 # 旧版固定延迟项；移植后的 Aimer 按帧时间戳预测，不再读取
+low_speed_delay_time: 0.010 # 旧版固定延迟项；移植后的 Aimer 按帧时间戳预测，不再读取
+
+#####-----Planner参数-----#####
+# 先沿用 SRM 的 MPC 权重与约束；哨兵的响应延迟未实测，补偿和换板提前量先关闭。
+fire_thresh: 0.003 # rad，反馈/参考合成误差上限
+planner_max_iter: 30 # TinyMPC 每帧最大迭代次数
+planner_gimbal_response_delay_ms: 0 # ms，实测后再设置
+planner_preview_max_advance_deg: 0 # deg，0 表示关闭换板提前过渡
+planner_preview_advance_rate_deg_s: 0 # deg/s，提前过渡的最大变化率
+max_yaw_acc: 50 # rad/s²
+Q_yaw: [9e6, 0]
+R_yaw: [1]
+max_pitch_acc: 100 # rad/s²
+Q_pitch: [9e6, 0]
+R_pitch: [1]
 
 #####-----shooter参数-----#####
 first_tolerance: 5 # 近距离射击容差，degree
@@ -104,10 +164,10 @@ R_gimbal2imubody: [1, 0, 0, 0, 1, 0, 0, 0, 1]
 
 camera_matrix: [2394.2968351123723, 0, 700.794528351022, 0, 2392.2453563225076, 513.82049364671298, 0, 0, 1]
 distort_coeffs: [-0.10002693673957498, 0.15369818776897518, -0.0020910886143118606, -0.0014207511445048437, 0]
+pnp_lightbar_length: 0.056 # m，沿用原 Solver 的 56 mm 有效灯条长度
 
 # 相机同理想情况的偏角: yaw1.69 pitch0.30 roll-0.07 degree
 # 标定板到世界坐标系原点的水平距离: 2.56 m
 # 标定板同竖直摆放时的偏角: yaw11.36 pitch7.38 roll0.83 degree
 R_camera2gimbal: [-0.02943460703555785, 0.0052379785200594667, 0.99955298383311619, -0.99956599593985174, -0.0013479215865163055, -0.029427926671258341, 0.0011931761959813833, -0.99998537323723913, 0.0052753807583291934]
 t_camera2gimbal: [-0.038221732177855426, -0.0072747106983809132, 0.14118517902311795]
-

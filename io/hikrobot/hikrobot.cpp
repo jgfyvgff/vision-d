@@ -8,8 +8,10 @@ using namespace std::chrono_literals;
 
 namespace io
 {
-HikRobot::HikRobot(double exposure_ms, double gain, const std::string & vid_pid)
-: exposure_us_(exposure_ms * 1e3), gain_(gain), queue_(1), daemon_quit_(false), vid_(-1), pid_(-1)
+HikRobot::HikRobot(
+  double exposure_ms, double gain, double frame_rate_fps, const std::string & vid_pid)
+: exposure_us_(exposure_ms * 1e3), gain_(gain), frame_rate_fps_(frame_rate_fps), queue_(1),
+  daemon_quit_(false), vid_(-1), pid_(-1)
 {
   set_vid_pid(vid_pid);
   if (libusb_init(NULL)) tools::logger()->warn("Unable to init libusb!");
@@ -51,6 +53,18 @@ void HikRobot::read(cv::Mat & img, std::chrono::steady_clock::time_point & times
   timestamp = data.timestamp;
 }
 
+bool HikRobot::read_for(
+  cv::Mat & img, std::chrono::steady_clock::time_point & timestamp,
+  std::chrono::milliseconds timeout)
+{
+  CameraData data;
+  if (!queue_.pop_for(data, timeout)) return false;
+
+  img = data.img;
+  timestamp = data.timestamp;
+  return true;
+}
+
 void HikRobot::capture_start()
 {
   capturing_ = false;
@@ -87,7 +101,12 @@ void HikRobot::capture_start()
   set_enum_value("GainAuto", MV_GAIN_MODE_OFF);
   set_float_value("ExposureTime", exposure_us_);
   set_float_value("Gain", gain_);
-  MV_CC_SetFrameRate(handle_, 150);
+  ret = MV_CC_SetFrameRate(handle_, static_cast<float>(frame_rate_fps_));
+  if (ret != MV_OK) {
+    tools::logger()->warn("MV_CC_SetFrameRate({:.1f}) failed: {:#x}", frame_rate_fps_, ret);
+  } else {
+    tools::logger()->info("HikRobot requested frame rate: {:.1f} fps", frame_rate_fps_);
+  }
 
   ret = MV_CC_StartGrabbing(handle_);
   if (ret != MV_OK) {

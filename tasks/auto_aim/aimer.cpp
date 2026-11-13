@@ -3,6 +3,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include <cmath>
+#include <utility>
 #include <vector>
 
 #include "tools/logger.hpp"
@@ -19,8 +20,6 @@ Aimer::Aimer(const std::string & config_path)
   pitch_offset_ = yaml["pitch_offset"].as<double>() / 57.3;    // degree to rad
   comming_angle_ = yaml["comming_angle"].as<double>() / 57.3;  // degree to rad
   leaving_angle_ = yaml["leaving_angle"].as<double>() / 57.3;  // degree to rad
-  high_speed_delay_time_ = yaml["high_speed_delay_time"].as<double>();
-  low_speed_delay_time_ = yaml["low_speed_delay_time"].as<double>();
   decision_speed_ = yaml["decision_speed"].as<double>();
   if (yaml["left_yaw_offset"].IsDefined() && yaml["right_yaw_offset"].IsDefined()) {
     left_yaw_offset_ = yaml["left_yaw_offset"].as<double>() / 57.3;    // degree to rad
@@ -33,40 +32,72 @@ io::Command Aimer::aim(
   std::list<Target> targets, std::chrono::steady_clock::time_point timestamp, double bullet_speed,
   bool to_now)
 {
-  if (targets.empty()) return {false, false, 0, 0};
+  return aim_impl(std::move(targets), timestamp, bullet_speed, to_now, true);
+}
+
+io::Command Aimer::aim_with_explicit_speed(
+  std::list<Target> targets, std::chrono::steady_clock::time_point timestamp, double bullet_speed,
+  bool to_now)
+{
+  return aim_impl(std::move(targets), timestamp, bullet_speed, to_now, false);
+}
+
+io::Command Aimer::aim_impl(
+  std::list<Target> targets, std::chrono::steady_clock::time_point timestamp, double bullet_speed,
+  bool to_now, bool allow_legacy_speed_fallback)
+{
+  debug_prediction_dt = -1.0;
+  debug_high_speed_mode = false;
+  debug_delay_time = 0.0;
+  debug_base_prediction_dt = -1.0;
+  debug_fly_time = -1.0;
+  if (targets.empty()) {
+    // 目标丢失后清除旧锁，避免下一辆车继承上一次的选板 ID。
+    lock_id_ = -1;
+    return {false, false, 0, 0};
+  }
+  if (!allow_legacy_speed_fallback &&
+      (!std::isfinite(bullet_speed) || bullet_speed <= 0.0)) {
+    debug_aim_point.valid = false;
+    return {false, false, 0, 0};
+  }
   auto target = targets.front();
 
-  auto ekf = target.ekf();
-  double delay_time =
-    target.ekf_x()[7] > decision_speed_ ? high_speed_delay_time_ : low_speed_delay_time_;
+  // 高速标记只服务于选板策略；它不再决定一个人为指定的预测延迟。
+  const auto angular_speed = std::abs(target.ekf_x()[7]);
+  debug_high_speed_mode = angular_speed > decision_speed_;
+  const auto aim_start = std::chrono::steady_clock::now();
+  debug_delay_time = to_now ? tools::delta_time(aim_start, timestamp) : 0.0;
 
-  if (bullet_speed < 14) bullet_speed = 23;
+  // 旧调用者保留历史行为；真机显式弹速接口不会把有效低速反馈替换成 23 m/s。
+  if (allow_legacy_speed_fallback && bullet_speed < 14) bullet_speed = 23;
 
-  // 考虑detecor和tracker所消耗的时间，此外假设aimer的用时可忽略不计
+  // timestamp 是观测时间；to_now 模式直接预测到当前实际计算时刻。
+  // 不再叠加高低速固定延迟，也不在离线模式中伪造 5ms 算法耗时。
   auto future = timestamp;
   if (to_now) {
-    double dt;
-    dt = tools::delta_time(std::chrono::steady_clock::now(), timestamp) + delay_time;
-    future += std::chrono::microseconds(int(dt * 1e6));
+    future = aim_start;
     target.predict(future);
   }
-
   else {
-    auto dt = 0.005 + delay_time;  //detector-aimer耗时0.005+发弹延时0.1
-    // tools::logger()->info("dt is {:.4f} second", dt);
-    future += std::chrono::microseconds(int(dt * 1e6));
+    // 离线测试由调用方决定 timestamp 的语义，不擅自增加固定耗时。
     target.predict(future);
   }
 
-  auto aim_point0 = choose_aim_point(target);
+  debug_base_prediction_dt =
+    std::chrono::duration<double>(future - timestamp).count();
+
+  // 当前时刻的瞄点仅用于估算飞行时间，不改变跨帧选板锁。
+  int preview_lock_id = lock_id_;
+  auto aim_point0 = choose_aim_point(target, preview_lock_id);
   debug_aim_point = aim_point0;
   if (!aim_point0.valid) {
     // tools::logger()->debug("Invalid aim_point0.");
     return {false, false, 0, 0};
   }
 
-  Eigen::Vector3d xyz0 = aim_point0.xyza.head(3);
-  auto d0 = std::sqrt(xyz0[0] * xyz0[0] + xyz0[1] * xyz0[1]);
+  Eigen::Vector3d xyz0 = aim_point0.xyza.head(3);//head(3)取前三个元素
+  auto d0 = std::sqrt(xyz0[0] * xyz0[0] + xyz0[1] * xyz0[1]);//计算距离
   tools::Trajectory trajectory0(bullet_speed, d0, xyz0[2]);
   if (trajectory0.unsolvable) {
     tools::logger()->debug(
@@ -78,16 +109,22 @@ io::Command Aimer::aim(
   // 迭代求解飞行时间 (最多10次，收敛条件：相邻两次fly_time差 <0.001)
   bool converged = false;
   double prev_fly_time = trajectory0.fly_time;
+  double final_prediction_dt = -1.0;
   tools::Trajectory current_traj = trajectory0;
+  int final_lock_id = lock_id_;
   std::vector<Target> iteration_target(10, target);  // 创建10个目标副本用于迭代预测
 
   for (int iter = 0; iter < 10; ++iter) {
     // 预测目标在 future + prev_fly_time 时刻的位置
     auto predict_time = future + std::chrono::microseconds(static_cast<int>(prev_fly_time * 1e6));
+    final_prediction_dt =
+      std::chrono::duration<double>(predict_time - timestamp).count();
     iteration_target[iter].predict(predict_time);
 
     // 计算瞄准点
-    auto aim_point = choose_aim_point(iteration_target[iter]);
+    // 各次飞行时间试算均从帧入口的锁开始，避免迭代顺序影响选板。
+    int candidate_lock_id = lock_id_;
+    auto aim_point = choose_aim_point(iteration_target[iter], candidate_lock_id);
     debug_aim_point = aim_point;
     if (!aim_point.valid) {
       return {false, false, 0, 0};
@@ -106,6 +143,7 @@ io::Command Aimer::aim(
       debug_aim_point.valid = false;
       return {false, false, 0, 0};
     }
+    final_lock_id = candidate_lock_id;
 
     // 检查收敛条件
     if (std::abs(current_traj.fly_time - prev_fly_time) < 0.001) {
@@ -119,6 +157,9 @@ io::Command Aimer::aim(
   Eigen::Vector3d final_xyz = debug_aim_point.xyza.head(3);
   double yaw = std::atan2(final_xyz.y(), final_xyz.x()) + yaw_offset_;
   double pitch = -(current_traj.pitch + pitch_offset_);  //世界坐标系下pitch向上为负
+  debug_prediction_dt = final_prediction_dt;
+  debug_fly_time = current_traj.fly_time;
+  lock_id_ = final_lock_id;
   return {true, false, yaw, pitch};
 }
 
@@ -133,7 +174,7 @@ io::Command Aimer::aim(
     yaw_offset = right_yaw_offset_.value();
   } else {
     yaw_offset = yaw_offset_;
-  }
+  }//判断左右侧射击，设置偏移量
 
   auto command = aim(targets, timestamp, bullet_speed, to_now);
   command.yaw = command.yaw - yaw_offset_ + yaw_offset;
@@ -141,13 +182,20 @@ io::Command Aimer::aim(
   return command;
 }
 
-AimPoint Aimer::choose_aim_point(const Target & target)
+AimPoint Aimer::preview_aim_point(const Target & target, int & preview_lock_id) const
+{
+  return choose_aim_point(target, preview_lock_id);
+}
+
+AimPoint Aimer::choose_aim_point(const Target & target, int & lock_id) const
 {
   Eigen::VectorXd ekf_x = target.ekf_x();
   std::vector<Eigen::Vector4d> armor_xyza_list = target.armor_xyza_list();
   auto armor_num = armor_xyza_list.size();
-  // 如果装甲板未发生过跳变，则只有当前装甲板的位置已知
-  if (!target.jumped) return {true, armor_xyza_list[0]};
+  // 同济原版在首次捕获时直接瞄准当前观测板，但不提前建立低速跨帧锁。
+  if (!target.jumped) {
+    return {true, armor_xyza_list[0], 0};
+  }
 
   // 整车旋转中心的球坐标yaw
   auto center_yaw = std::atan2(ekf_x[2], ekf_x[0]);
@@ -160,7 +208,8 @@ AimPoint Aimer::choose_aim_point(const Target & target)
   }
 
   // 不考虑小陀螺
-  if (std::abs(target.ekf_x()[8]) <= 2 && target.name != ArmorName::outpost) {
+  // x[7] 是角速度，x[8] 是旋转半径；低速时使用普通装甲板选择策略。
+  if (std::abs(ekf_x[7]) <= decision_speed_ && target.name != ArmorName::outpost) {
     // 选择在可射击范围内的装甲板
     std::vector<int> id_list;
     for (int i = 0; i < armor_num; i++) {
@@ -170,7 +219,7 @@ AimPoint Aimer::choose_aim_point(const Target & target)
     // 绝无可能
     if (id_list.empty()) {
       tools::logger()->warn("Empty id list!");
-      return {false, armor_xyza_list[0]};
+      return {false, armor_xyza_list[0], -1};
     }
 
     // 锁定模式：防止在两个都呈45度的装甲板之间来回切换
@@ -178,15 +227,15 @@ AimPoint Aimer::choose_aim_point(const Target & target)
       int id0 = id_list[0], id1 = id_list[1];
 
       // 未处于锁定模式时，选择delta_angle绝对值较小的装甲板，进入锁定模式
-      if (lock_id_ != id0 && lock_id_ != id1)
-        lock_id_ = (std::abs(delta_angle_list[id0]) < std::abs(delta_angle_list[id1])) ? id0 : id1;
+      if (lock_id != id0 && lock_id != id1)
+        lock_id = (std::abs(delta_angle_list[id0]) < std::abs(delta_angle_list[id1])) ? id0 : id1;
 
-      return {true, armor_xyza_list[lock_id_]};
+      return {true, armor_xyza_list[lock_id], lock_id};
     }
 
-    // 只有一个装甲板在可射击范围内时，退出锁定模式
-    lock_id_ = -1;
-    return {true, armor_xyza_list[id_list[0]]};
+    // 只有一块板可选时退出双板锁；再次出现两块候选时按角度重新选择。
+    lock_id = -1;
+    return {true, armor_xyza_list[id_list[0]], id_list[0]};
   }
 
   double coming_angle, leaving_angle;
@@ -201,11 +250,13 @@ AimPoint Aimer::choose_aim_point(const Target & target)
   // 在小陀螺时，一侧的装甲板不断出现，另一侧的装甲板不断消失，显然前者被打中的概率更高
   for (int i = 0; i < armor_num; i++) {
     if (std::abs(delta_angle_list[i]) > coming_angle) continue;
-    if (ekf_x[7] > 0 && delta_angle_list[i] < leaving_angle) return {true, armor_xyza_list[i]};
-    if (ekf_x[7] < 0 && delta_angle_list[i] > -leaving_angle) return {true, armor_xyza_list[i]};
+    if (ekf_x[7] > 0 && delta_angle_list[i] < leaving_angle)
+      return {true, armor_xyza_list[i], i};
+    if (ekf_x[7] < 0 && delta_angle_list[i] > -leaving_angle)
+      return {true, armor_xyza_list[i], i};
   }
 
-  return {false, armor_xyza_list[0]};
+  return {false, armor_xyza_list[0], -1};
 }
 
 }  // namespace auto_aim

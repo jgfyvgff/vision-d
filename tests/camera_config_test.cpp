@@ -30,7 +30,16 @@ int main(int argc, char * argv[])
   }
 
   expect_camera(cameras, "front", "hikrobot");
-  expect_camera(cameras, "left", "uvc", "video0");
-  expect_camera(cameras, "right", "uvc", "video2");
+  expect_camera(cameras, "left", "uvc", "video2");
+  expect_camera(cameras, "right", "uvc", "video0");
+  const auto & front = io::camera_config_for_role(cameras, "front");
+  const auto & left = io::camera_config_for_role(cameras, "left");
+  const auto & right = io::camera_config_for_role(cameras, "right");
+  if (front.frame_rate_fps != 150.0 || front.exposure_ms != 5.0 || front.gain != 16.9 ||
+      left.frame_rate_fps != 60.0 || left.usb_exposure != 40.0 || left.usb_gain != 10.0 ||
+      left.usb_gamma != 160.0 || right.frame_rate_fps != 60.0 ||
+      right.usb_exposure != 40.0 || right.usb_gain != 10.0 || right.usb_gamma != 160.0) {
+    throw std::runtime_error("Unexpected per-camera capture parameter configuration");
+  }
   return 0;
 }

@@ -2,6 +2,9 @@
 #define AUTO_AIM__PLANNER_HPP
 
 #include <Eigen/Dense>
+#include <array>
+#include <chrono>
+#include <cstdint>
 #include <list>
 #include <optional>
 
@@ -10,6 +13,8 @@
 
 namespace auto_aim
 {
+class Aimer;
+
 constexpr double DT = 0.01;
 constexpr int HALF_HORIZON = 50;
 constexpr int HORIZON = HALF_HORIZON * 2;
@@ -22,12 +27,73 @@ struct Plan
   bool fire;
   float target_yaw;
   float target_pitch;
+  // 与 MPC 下发角对齐的 20 ms 目标参考；供 MPC 未收敛时回退使用。
+  float command_target_yaw = 0.0F;
+  float command_target_pitch = 0.0F;
+  // 当前物理板的局部 yaw 斜率，单位 rad/s；换板后用于建立新直线。
+  float command_target_yaw_vel = 0.0F;
+  // 统一选择 MPC 或回退角后，供 TX 发送的最终 yaw。
+  float tx_raw_yaw = 0.0F;
+  float tx_yaw = 0.0F;
+  bool tx_yaw_valid = false;
+  bool tx_yaw_spike_suppressed = false;
+  // 切板预览额外施加的平滑提前量，单位 rad；不写入同板基准直线。
+  float tx_preview_advance_yaw = 0.0F;
+  double gimbal_response_delay_ms = 0.0;
+  double target_lead_compensation_ms = 0.0;
   float yaw;
   float yaw_vel;
   float yaw_acc;
   float pitch;
   float pitch_vel;
   float pitch_acc;
+  // 100 ms 轨迹仅用于只读对比；角度单位 rad，求解残差使用 TinyMPC 原始单位。
+  float target_yaw_100ms = 0.0F;
+  float target_pitch_100ms = 0.0F;
+  float yaw_100ms = 0.0F;
+  float pitch_100ms = 0.0F;
+  int yaw_solver_status = -1;
+  int pitch_solver_status = -1;
+  int yaw_solver_iterations = 0;
+  int pitch_solver_iterations = 0;
+  double yaw_primal_residual_max = 0.0;
+  double yaw_dual_residual_max = 0.0;
+  double pitch_primal_residual_max = 0.0;
+  double pitch_dual_residual_max = 0.0;
+  // 新真机只读入口可记录未收敛但有限的轨迹；只有收敛结果允许 control=true。
+  bool diagnostic_valid = false;
+  bool solver_converged = false;
+  // 当前参考角减云台反馈角，单位 rad；同时用于反馈对准诊断与开火判据。
+  double feedback_yaw_error_rad = 0.0;
+  double feedback_pitch_error_rad = 0.0;
+  // 两轴反馈误差合成值，单位 rad；与 fire_thresh 直接比较。
+  double fire_alignment_error_rad = 0.0;
+  // 规划轨迹与近未来参考轨迹的角度误差，单位 rad；仅真机入口使用。
+  double fire_reference_error_rad = 0.0;
+  // 从当前时刻算起，预测参考轨迹首次换板的 10 ms 步数；-1 表示窗口内未换板。
+  int preview_switch_step = -1;
+  int preview_switch_id = -1;
+};
+
+// 云台当前状态属于 world 绝对角，单位 rad、rad/s；与轨迹参考共用坐标和符号约定。
+struct PlannerState
+{
+  double yaw = 0.0;
+  double yaw_vel = 0.0;
+  double pitch = 0.0;
+  double pitch_vel = 0.0;
+};
+
+// 离线回放专用：逐 10 ms 保存未来绝对 yaw 参考和首次换板目标；不写回 Aimer 锁。
+struct SwitchPreview
+{
+  bool valid = false;
+  int switch_step = -1;
+  int switch_id = -1;
+  std::array<double, HORIZON> yaw_rad{};
+  std::array<double, HORIZON> yaw_vel_rad_s{};
+  // 与 yaw_rad 同列的装甲 ID，供离线拟合确认单侧差分没有跨板。
+  std::array<int, HORIZON> armor_id{};
 };
 
 class Planner
@@ -35,15 +101,53 @@ class Planner
 public:
   Eigen::Vector4d debug_xyza;
   Planner(const std::string & config_path);
+  // 设置 TX 到云台响应的有效滞后估计，范围 [0, 100] ms。
+  void set_gimbal_response_delay_ms(double delay_ms);
+  // 仅在实际准备发送时调用；同板抑制突刺，确认切板预览后限速提前过渡。
+  void prepare_tx_yaw(
+    Plan & plan, std::uint64_t target_generation, int armor_id,
+    std::chrono::steady_clock::time_point now);
+  void reset_tx_yaw();
 
   Plan plan(Target target, double bullet_speed);
   Plan plan(std::optional<Target> target, double bullet_speed);
+  // 传入 Aimer 时，以参考角及参考速度为规划初态，并沿未来窗口预览选板。
+  // 不传 Aimer 的兼容入口仍使用实测初态；预览不会写回真实 Aimer 的锁。
+  Plan plan(
+    Target target, double bullet_speed, const PlannerState & state,
+    std::optional<int> armor_id = std::nullopt,
+    const Aimer * preview_aimer = nullptr,
+    SwitchPreview * switch_preview = nullptr);
+  // 仅用于离线比较：重建可确定的选板历史，返回居中窗口当前时刻的规划值。
+  // 不设置 control，不允许结果进入真机命令路径。
+  Plan plan_centered_diagnostic(
+    Target target, double bullet_speed, int armor_id, const Aimer & preview_aimer);
 
 private:
+  struct TxYawLine
+  {
+    bool valid = false;
+    std::uint64_t target_generation = 0;
+    int armor_id = -1;
+    std::chrono::steady_clock::time_point time{};
+    double yaw = 0.0;  // 不折返的连续角，单位 rad。
+    double velocity = 0.0;  // 单位 rad/s。
+    double last_rejected_yaw = 0.0;
+    int rejected_count = 0;
+    int preview_switch_id = -1;
+    double preview_advance = 0.0;  // 与同板基准直线分离，单位 rad。
+  };
+
+  TxYawLine tx_yaw_line_;
   double yaw_offset_;
   double pitch_offset_;
   double fire_thresh_;
-  double low_speed_delay_time_, high_speed_delay_time_, decision_speed_;
+  double gimbal_response_delay_ms_ = 0.0;
+  double preview_max_advance_rad_ = 0.0;
+  double preview_advance_rate_rad_s_ = 0.0;
+  // TinyMPC 迭代上限。真机日志显示 yaw 的迭代次数中位正好等于 10（撞上限），
+  // 是未收敛帧的主要来源，因此做成可配参数以便不重编就能比较收敛率。
+  int max_iter_;
 
   TinySolver * yaw_solver_;
   TinySolver * pitch_solver_;
@@ -51,8 +155,18 @@ private:
   void setup_yaw_solver(const std::string & config_path);
   void setup_pitch_solver(const std::string & config_path);
 
-  Eigen::Matrix<double, 2, 1> aim(const Target & target, double bullet_speed);
-  Trajectory get_trajectory(Target & target, double yaw0, double bullet_speed);
+  Eigen::Matrix<double, 2, 1> aim(
+    const Target & target, double bullet_speed,
+    std::optional<int> armor_id = std::nullopt);
+  Trajectory get_trajectory(
+    Target & target, double yaw0, double bullet_speed, bool start_at_now = false,
+    std::optional<int> armor_id = std::nullopt,
+    const Aimer * preview_aimer = nullptr, int * preview_switch_step = nullptr,
+    int * preview_switch_id = nullptr,
+    std::array<int, HORIZON> * preview_armor_ids = nullptr);
+  std::optional<Trajectory> get_centered_trajectory(
+    const Target & target, double yaw0, double bullet_speed,
+    int armor_id, const Aimer & preview_aimer);
 };
 
 }  // namespace auto_aim

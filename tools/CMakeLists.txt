@@ -9,6 +9,7 @@ add_library(tools OBJECT
     plotter.cpp
     trajectory.cpp
     recorder.cpp
+    jsonl_recorder.cpp
     logger.cpp
     pid.cpp
     crc.cpp

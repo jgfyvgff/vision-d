@@ -115,6 +115,10 @@ target_link_libraries(planner_test_offline ${OpenCV_LIBS} fmt::fmt yaml-cpp auto
 add_executable(sentry_multithread src/sentry_multithread.cpp)
 target_link_libraries(sentry_multithread fmt::fmt yaml-cpp auto_aim omniperception tools io ${OpenCV_LIBS})
 
+# 独立自瞄入口，不依赖全向感知模块。
+add_executable(sentry_auto_aim_test src/sentry_auto_aim_test.cpp)
+target_link_libraries(sentry_auto_aim_test fmt::fmt yaml-cpp auto_aim tools io ${OpenCV_LIBS})
+
 # 只有在找到 ROS 环境时才会添加 ROS 相关的 sentry 和 publish_test
 if(SRM_VISION_ENABLE_ROS2 AND ament_cmake_FOUND AND rclcpp_FOUND AND std_msgs_FOUND AND rosidl_typesupport_cpp_FOUND)
     # 编译 sentry 和 publish_test

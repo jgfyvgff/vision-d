@@ -1,6 +1,10 @@
 #include "target.hpp"
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include <numeric>
+#include <stdexcept>
 
 #include "tools/logger.hpp"
 #include "tools/math_tools.hpp"
@@ -21,6 +25,11 @@ Target::Target(
   is_converged_(false),
   switch_count_(0)
 {
+  // 保留 Tracker 配置化前独立构造前哨站目标时的过程噪声默认值。
+  if (name == ArmorName::outpost) {
+    translation_acceleration_variance_ = 10.0;
+    angular_acceleration_variance_ = 0.1;
+  }
   auto r = radius;
   priority = armor.priority;
   const Eigen::VectorXd & xyz = armor.xyz_in_world;
@@ -37,12 +46,12 @@ Target::Target(
   // l: r2 - r1
   // h: z2 - z1
   Eigen::VectorXd x0{{center_x, 0, center_y, 0, center_z, 0, ypr[0], 0, r, 0, 0}};  //初始化预测量
-  Eigen::MatrixXd P0 = P0_dig.asDiagonal();
+  Eigen::MatrixXd P0 = P0_dig.asDiagonal();//初始化协方差矩阵，这里使用对角矩阵
 
   // 防止夹角求和出现异常值
   auto x_add = [](const Eigen::VectorXd & a, const Eigen::VectorXd & b) -> Eigen::VectorXd {
     Eigen::VectorXd c = a + b;
-    c[6] = tools::limit_rad(c[6]);
+    c[6] = tools::limit_rad(c[6]);//yaw角度限制在[-pi, pi]范围内
     return c;
   };
 
@@ -93,14 +102,33 @@ void Target::predict(double dt)
 
   // Piecewise White Noise Model
   // https://github.com/rlabbe/Kalman-and-Bayesian-Filters-in-Python/blob/master/07-Kalman-Filter-Math.ipynb
-  double v1, v2;
-  if (name == ArmorName::outpost) {
-    v1 = 10;   // 前哨站加速度方差
-    v2 = 0.1;  // 前哨站角加速度方差
-  } else {
-    v1 = 100;  // 加速度方差
-    v2 = 400;  // 角加速度方差
-  }
+//   在这 `dt` 内，假设有一个恒定的随机加速度 `a_noise`（方差为 σ²，每步独立）：
+// 位置: x' = x + v·dt + ½·a_noise·dt²
+// 速度: v' = v + a_noise·dt
+//              ↑                     ↑
+//         (加速度对位置的影响)   (加速度对速度的影响)
+// __这个随机加速度给位置和速度带来的不确定量：
+// Δ位置 = ½·a_noise·dt²
+// Δ速度 = a_noise·dt
+// 成向量形式：`噪声 = [½dt²; dt] · a_noise`
+// __协方差__ = 噪声×噪声ᵀ 的期望：
+// Q_2x2 = E[ [½dt²]·a_noise · a_noise·[½dt², dt] ]
+//            [ dt ]
+//       = [½dt²]·E[a_noise²]·[½dt², dt]
+//         [ dt ]
+//       = σ² · [½dt²]·[½dt², dt]
+//              [ dt ]
+//       = σ² · [ dt²·dt²/4   dt·dt²/2 ]
+//              [ dt·dt²/2    dt·dt     ]
+//       = σ² · [ dt⁴/4   dt³/2 ]
+//              [ dt³/2   dt²   ]
+
+
+
+
+
+  const double v1 = translation_acceleration_variance_;
+  const double v2 = angular_acceleration_variance_;
   auto a = dt * dt * dt * dt / 4;
   auto b = dt * dt * dt / 2;
   auto c = dt * dt;
@@ -124,7 +152,7 @@ void Target::predict(double dt)
   // 防止夹角求和出现异常值
   auto f = [&](const Eigen::VectorXd & x) -> Eigen::VectorXd {
     Eigen::VectorXd x_prior = F * x;
-    x_prior[6] = tools::limit_rad(x_prior[6]);
+    x_prior[6] = tools::limit_rad(x_prior[6]);//yaw角度限制在[-pi, pi]范围内
     return x_prior;
   };
 
@@ -132,71 +160,246 @@ void Target::predict(double dt)
   if (this->convergened() && this->name == ArmorName::outpost && std::abs(this->ekf_.x[7]) > 2)
     this->ekf_.x[7] = this->ekf_.x[7] > 0 ? 2.51 : -2.51;
 
-  ekf_.predict(F, Q, f);
-}
+  ekf_.predict(F, Q, f);//计算预测量和预测协方差矩阵
+}//
 
-void Target::update(const Armor & armor)
+std::vector<ArmorMatch> Target::match_armors(const Armor & armor) const
 {
-  // 装甲板匹配
-  int id;
-  auto min_angle_error = 1e10;
+  std::vector<ArmorMatch> matches;
   const std::vector<Eigen::Vector4d> & xyza_list = armor_xyza_list();
+  const Eigen::Matrix4d R = measurement_noise(armor);
 
-  std::vector<std::pair<Eigen::Vector4d, int>> xyza_i_list;
   for (int i = 0; i < armor_num_; i++) {
-    xyza_i_list.push_back({xyza_list[i], i});
-  }
-
-  std::sort(
-    xyza_i_list.begin(), xyza_i_list.end(),
-    [](const std::pair<Eigen::Vector4d, int> & a, const std::pair<Eigen::Vector4d, int> & b) {
-      Eigen::Vector3d ypd1 = tools::xyz2ypd(a.first.head(3));
-      Eigen::Vector3d ypd2 = tools::xyz2ypd(b.first.head(3));
-      return ypd1[2] < ypd2[2];
-    });
-
-  // 取前3个distance最小的装甲板
-  for (int i = 0; i < 3; i++) {
-    const auto & xyza = xyza_i_list[i].first;
+    const auto & xyza = xyza_list[i];
     Eigen::Vector3d ypd = tools::xyz2ypd(xyza.head(3));
     auto angle_error = std::abs(tools::limit_rad(armor.ypr_in_world[0] - xyza[3])) +
                        std::abs(tools::limit_rad(armor.ypd_in_world[0] - ypd[0]));
 
-    if (std::abs(angle_error) < std::abs(min_angle_error)) {
-      id = xyza_i_list[i].second;
-      min_angle_error = angle_error;
-    }
+    Eigen::Vector4d innovation{
+      tools::limit_rad(armor.ypd_in_world[0] - ypd[0]),
+    armor.ypd_in_world[1] - ypd[1],
+    armor.ypd_in_world[2] - ypd[2],
+    tools::limit_rad(armor.ypr_in_world[0] - xyza[3])};
+    const auto H = h_jacobian(ekf_.x, i);
+    const Eigen::Matrix4d S = H * ekf_.P * H.transpose() + R;
+    Eigen::LDLT<Eigen::Matrix4d> ldlt(S);
+    if (ldlt.info() != Eigen::Success) continue;
+
+    const auto squared_distance = innovation.dot(ldlt.solve(innovation));
+    if (!std::isfinite(squared_distance) || squared_distance < 0.0) continue;
+    const auto mahalanobis_distance = std::sqrt(squared_distance);
+
+    matches.push_back({i, angle_error, mahalanobis_distance, true});
   }
 
-  if (id != 0) jumped = true;
+  return matches;
+}
+
+ArmorMatch Target::match_armor(const Armor & armor) const
+{
+  const auto matches = match_armors(armor);
+  if (matches.empty()) return {};
+  return *std::min_element(
+    matches.begin(), matches.end(),
+    [](const ArmorMatch & a, const ArmorMatch & b) {
+      if (a.mahalanobis_distance != b.mahalanobis_distance) {
+        return a.mahalanobis_distance < b.mahalanobis_distance;
+      }
+      return std::abs(a.angle_error) < std::abs(b.angle_error);
+    });
+}
+
+bool Target::update(const Armor & armor)
+{
+  return update(armor, match_armor(armor).id);
+}
+
+bool Target::update(
+  const Armor & armor, int id, std::optional<double> max_posterior_distance_error,
+  std::optional<double> max_abs_angular_velocity,
+  const Armor * measurement_noise_reference, double distance_update_r_scale,
+  TargetUpdateTrace * update_trace, double yaw_update_sigma_deg,
+  std::optional<double> distance_variance_override_m2)
+{
+  if (update_trace != nullptr) *update_trace = TargetUpdateTrace{};
+  if (
+    max_posterior_distance_error &&
+    (!std::isfinite(*max_posterior_distance_error) || *max_posterior_distance_error <= 0.0))
+  {
+    throw std::invalid_argument("Invalid posterior distance error limit");
+  }
+  if (
+    max_abs_angular_velocity &&
+    (!std::isfinite(*max_abs_angular_velocity) || *max_abs_angular_velocity <= 0.0))
+  {
+    throw std::invalid_argument("Invalid angular velocity limit");
+  }
+  if (!std::isfinite(distance_update_r_scale) || distance_update_r_scale < 1.0) {
+    throw std::invalid_argument("Distance update R scale must be finite and at least 1");
+  }
+  if (!std::isfinite(yaw_update_sigma_deg) ||
+      yaw_update_sigma_deg < 0.0 || yaw_update_sigma_deg > 180.0) {
+    throw std::invalid_argument("Yaw update sigma must be finite and in [0, 180] degrees");
+  }
+  // 几何尺度模式只在离线实验使用；方差必须有限且非负，避免静默放宽到非法值。
+  if (distance_variance_override_m2.has_value() &&
+      (!std::isfinite(*distance_variance_override_m2) || *distance_variance_override_m2 < 0.0)) {
+    throw std::invalid_argument("Distance variance override must be finite and non-negative");
+  }
+  if (id < 0 || id >= armor_num_) return false;
+
+  // 状态机计数只在 EKF 更新成功后提交；失败帧不应伪装成一次装甲切换。
+  if (!update_ypda(
+        armor, id, max_posterior_distance_error, max_abs_angular_velocity,
+        measurement_noise_reference, distance_update_r_scale, update_trace,
+        yaw_update_sigma_deg, distance_variance_override_m2)) {
+    return false;
+  }
+
+  if (id != 0) jumped = true;//如果id不为0，说明跳过了
 
   if (id != last_id) {
-    is_switch_ = true;
+    is_switch_ = true;//如果id不等于上一次的id，说明切换了装甲板
   } else {
     is_switch_ = false;
   }
 
-  if (is_switch_) switch_count_++;
+  if (is_switch_) switch_count_++;//如果切换了装甲板，切换计数器加1
 
   last_id = id;
-  update_count_++;
+  update_count_++;//更新计数器加1
 
-  update_ypda(armor, id);
+  return true;
 }
 
-void Target::update_ypda(const Armor & armor, int id)
+void Target::set_geometry_constraint(
+  double radius, double radius_delta, double radius_variance,
+  double radius_delta_variance)
 {
+  if (radius <= 0.0 || radius_variance <= 0.0 || radius_delta_variance <= 0.0) {
+    throw std::invalid_argument("Invalid target geometry constraint");
+  }
+
+  geometry_constraint_ =
+    GeometryConstraint{radius, radius_delta, radius_variance, radius_delta_variance};
+  apply_geometry_constraint();
+}
+
+void Target::set_radius_delta_constraint(double radius_delta, double variance)
+{
+  if (!std::isfinite(radius_delta) || !std::isfinite(variance) || variance <= 0.0) {
+    throw std::invalid_argument("Invalid target radius delta constraint");
+  }
+  radius_delta_constraint_ = std::make_pair(radius_delta, variance);
+  apply_geometry_constraint();
+}
+
+void Target::set_measurement_bearing_variance(double variance)
+{
+  if (!std::isfinite(variance) || variance <= 0.0) {
+    throw std::invalid_argument("Invalid measurement bearing variance");
+  }
+  measurement_bearing_variance_ = variance;
+}
+
+void Target::set_translation_acceleration_variance(double variance)
+{
+  set_process_noise_variances(variance, angular_acceleration_variance_);
+}
+
+void Target::set_process_noise_variances(double translation_variance, double angular_variance)
+{
+  if (!std::isfinite(translation_variance) || translation_variance <= 0.0 ||
+      !std::isfinite(angular_variance) || angular_variance <= 0.0) {
+    throw std::invalid_argument("Invalid process noise variance");
+  }
+  translation_acceleration_variance_ = translation_variance;
+  angular_acceleration_variance_ = angular_variance;
+}
+
+void Target::set_measurement_noise_model(
+  double elevation_variance, double distance_log_scale, double distance_offset,
+  double armor_yaw_log_scale, double armor_yaw_offset)
+{
+  if (!std::isfinite(elevation_variance) || elevation_variance <= 0.0 ||
+      !std::isfinite(distance_log_scale) || distance_log_scale < 0.0 ||
+      !std::isfinite(distance_offset) || distance_offset <= 0.0 ||
+      !std::isfinite(armor_yaw_log_scale) || armor_yaw_log_scale < 0.0 ||
+      !std::isfinite(armor_yaw_offset) || armor_yaw_offset <= 0.0) {
+    throw std::invalid_argument("Invalid measurement noise model");
+  }
+  measurement_elevation_variance_ = elevation_variance;
+  measurement_distance_variance_log_scale_ = distance_log_scale;
+  measurement_distance_variance_offset_ = distance_offset;
+  measurement_armor_yaw_variance_log_scale_ = armor_yaw_log_scale;
+  measurement_armor_yaw_variance_offset_ = armor_yaw_offset;
+}
+
+void Target::apply_geometry_constraint()
+{
+  if (!geometry_constraint_.has_value() && !radius_delta_constraint_.has_value()) return;
+
+  auto constrain_state = [&](Eigen::Index index, double value, double variance) {
+    ekf_.x[index] = value;
+    // 已知机械尺寸不应继续与中心、速度和角速度共同漂移，因此同时清除互协方差。
+    ekf_.P.row(index).setZero();
+    ekf_.P.col(index).setZero();
+    ekf_.P(index, index) = variance;
+  };
+
+  if (geometry_constraint_) {
+    const auto & constraint = geometry_constraint_.value();
+    constrain_state(8, constraint.radius, constraint.radius_variance);
+    constrain_state(9, constraint.radius_delta, constraint.radius_delta_variance);
+  }
+  if (radius_delta_constraint_) {
+    constrain_state(9, radius_delta_constraint_->first, radius_delta_constraint_->second);
+  }
+}
+
+bool Target::update_ypda(
+  const Armor & armor, int id, std::optional<double> max_posterior_distance_error,
+  std::optional<double> max_abs_angular_velocity,
+  const Armor * measurement_noise_reference, double distance_update_r_scale,
+  TargetUpdateTrace * update_trace, double yaw_update_sigma_deg,
+  std::optional<double> distance_variance_override_m2)
+{
+  const auto center_from_state = [](const Eigen::VectorXd & state) {
+    return std::array<double, 3>{state[0], state[2], state[4]};
+  };
+  if (update_trace != nullptr) {
+    *update_trace = TargetUpdateTrace{};
+    update_trace->center_before = center_from_state(ekf_.x);
+    update_trace->center_after_attempt = update_trace->center_before;
+    update_trace->center_after_commit = update_trace->center_before;
+  }
+  const double prior_error =
+    (armor.xyz_in_world - h_armor_xyz(ekf_.x, id)).norm();
+  if (!std::isfinite(prior_error)) return false;
+
+  // EKF 的 x/P、NIS 历史和内部计数一起保存，避免后验失败时只恢复位置。
+  const auto prior_ekf = ekf_;
   //观测jacobi
   Eigen::MatrixXd H = h_jacobian(ekf_.x, id);
-  // Eigen::VectorXd R_dig{{4e-3, 4e-3, 1, 9e-2}};
-  auto center_yaw = std::atan2(armor.xyz_in_world[1], armor.xyz_in_world[0]);
-  auto delta_angle = tools::limit_rad(armor.ypr_in_world[0] - center_yaw);
-  Eigen::VectorXd R_dig{
-    {4e-3, 4e-3, log(std::abs(delta_angle) + 1) + 1,
-     log(std::abs(armor.ypd_in_world[2]) + 1) / 200 + 9e-2}};
-
-  //测量过程噪声偏差的方差
-  Eigen::MatrixXd R = R_dig.asDiagonal();
+    // 关联和 NIS 使用基准噪声；离线降权只改变更新 R，避免同时放宽检验标尺。
+  // 影子试验替换观测值时可沿用原始观测完整 R，保持方位、俯仰和 yaw 权重不变。
+  const Eigen::MatrixXd R_base = measurement_noise_reference != nullptr
+    ? measurement_noise(*measurement_noise_reference) : measurement_noise(armor);
+  Eigen::MatrixXd R_update = R_base;
+  R_update(2, 2) *= distance_update_r_scale;
+  // 几何尺度模式：距离方差由本次观测的 s_d 与 σ_px 直接合成，覆盖倍率结果。
+  if (distance_variance_override_m2.has_value()) {
+    R_update(2, 2) = *distance_variance_override_m2;
+  }
+  if (yaw_update_sigma_deg > 0.0) {
+    const double sigma_rad = yaw_update_sigma_deg * CV_PI / 180.0;
+    R_update(3, 3) = sigma_rad * sigma_rad;
+  }
+  // R_base 仍用于关联、NIS 标尺和后验距离容限；实验只改更新权重。
+    if (update_trace != nullptr) {
+        update_trace->distance_r_base_m2 = R_base(2, 2);
+        update_trace->distance_r_used_m2 = R_update(2, 2);
+    }
 
   // 定义非线性转换函数h: x -> z
   auto h = [&](const Eigen::VectorXd & x) -> Eigen::Vector4d {
@@ -219,7 +422,102 @@ void Target::update_ypda(const Armor & armor, int id)
   const Eigen::VectorXd & ypr = armor.ypr_in_world;
   Eigen::VectorXd z{{ypd[0], ypd[1], ypd[2], ypr[0]}};  //获得观测量
 
-  ekf_.update(z, H, R, h, z_subtract);
+  ekf_.update(z, H, R_update, h, z_subtract, &R_base);
+  if (update_trace != nullptr) {
+    update_trace->attempted = true;
+    if (ekf_.last_innovation.size() == 4 &&
+        ekf_.last_kalman_gain.rows() > 4 && ekf_.last_kalman_gain.cols() == 4) {
+      for (Eigen::Index column = 0; column < 4; ++column) {
+        update_trace->innovation[static_cast<std::size_t>(column)] =
+          ekf_.last_innovation[column];
+      }
+      const auto record_yaw_scale = [&](const Eigen::MatrixXd & covariance,
+                                        bool & valid, double & variance,
+                                        double & normalized) {
+        if (covariance.rows() <= 3 || covariance.cols() <= 3) return;
+        const double value = covariance(3, 3);
+        if (!std::isfinite(value) || value <= 0.0) return;
+        valid = true;
+        variance = value;
+        normalized = ekf_.last_innovation[3] / std::sqrt(value);
+      };
+      record_yaw_scale(ekf_.last_innovation_covariance,
+                       update_trace->yaw_update_scale_valid,
+                       update_trace->yaw_update_variance_rad2,
+                       update_trace->yaw_update_standardized_innovation);
+      record_yaw_scale(ekf_.last_nis_innovation_covariance,
+                       update_trace->yaw_base_scale_valid,
+                       update_trace->yaw_base_variance_rad2,
+                       update_trace->yaw_base_standardized_innovation);
+      constexpr std::array<Eigen::Index, 3> center_rows{0, 2, 4};
+      for (std::size_t row = 0; row < center_rows.size(); ++row) {
+        for (Eigen::Index column = 0; column < 4; ++column) {
+          update_trace->center_gain[row][static_cast<std::size_t>(column)] =
+            ekf_.last_kalman_gain(center_rows[row], column);
+        }
+      }
+    }
+  }
+  // 观测更新可能再次把不可观测半径拉向发散下限，更新后恢复已知机械尺寸。
+  apply_geometry_constraint();
+  if (update_trace != nullptr) {
+    update_trace->center_after_attempt = center_from_state(ekf_.x);
+  }
+  const double posterior_error =
+    (armor.xyz_in_world - h_armor_xyz(ekf_.x, id)).norm();
+  // 关联前后的距离必须服从同一门限；仅靠三维残差增长检查会放过
+  // 后验距离已经越界的更新。此检查不约束纯切向中心移动。
+  bool posterior_distance_limit_exceeded = false;
+  if (max_posterior_distance_error) {
+    const double posterior_distance_error = std::abs(
+      armor.ypd_in_world[2] - tools::xyz2ypd(h_armor_xyz(ekf_.x, id))[2]);
+    posterior_distance_limit_exceeded =
+      !std::isfinite(posterior_distance_error) ||
+      posterior_distance_error > *max_posterior_distance_error;
+  }
+  // 仿真车辆的物理转速有已知上限；拒绝超限后验，避免错误 ID 将角速度状态推高。
+  const bool angular_velocity_limit_exceeded = max_abs_angular_velocity &&
+    (!std::isfinite(ekf_.x[7]) || std::abs(ekf_.x[7]) > *max_abs_angular_velocity);
+  // 仿真中机械尺寸已知时，一次更新若让三维残差恶化超过整个装甲旋转直径，
+  // 就不能再用相邻装甲切换解释；其他目标保持原距离观测噪声判据。
+  const double allowed_growth = geometry_constraint_
+                                  ? 2.0 * std::max(
+                                      std::abs(geometry_constraint_->radius),
+                                      std::abs(
+                                        geometry_constraint_->radius +
+                                        geometry_constraint_->radius_delta))
+                                  : std::sqrt(R_base(2, 2));
+  if (
+    !ekf_.x.allFinite() || !ekf_.P.allFinite() || !std::isfinite(posterior_error) ||
+    posterior_distance_limit_exceeded || angular_velocity_limit_exceeded ||
+    posterior_error > prior_error + allowed_growth)
+  {
+    ekf_ = prior_ekf;
+    if (update_trace != nullptr) {
+      update_trace->accepted = false;
+      update_trace->center_after_commit = center_from_state(ekf_.x);
+    }
+    return false;
+  }
+  if (update_trace != nullptr) {
+    update_trace->accepted = true;
+    update_trace->center_after_commit = center_from_state(ekf_.x);
+  }
+  return true;
+}
+
+Eigen::Matrix4d Target::measurement_noise(const Armor & armor) const
+{
+  const auto center_yaw = std::atan2(armor.xyz_in_world[1], armor.xyz_in_world[0]);
+  const auto delta_angle = tools::limit_rad(armor.ypr_in_world[0] - center_yaw);
+  Eigen::Matrix4d R = Eigen::Matrix4d::Zero();
+  R.diagonal() << measurement_bearing_variance_, measurement_elevation_variance_,
+    measurement_distance_variance_log_scale_ * std::log(std::abs(delta_angle) + 1) +
+      measurement_distance_variance_offset_,
+    measurement_armor_yaw_variance_log_scale_ *
+      std::log(std::abs(armor.ypd_in_world[2]) + 1) +
+      measurement_armor_yaw_variance_offset_;
+  return R;
 }
 
 Eigen::VectorXd Target::ekf_x() const { return ekf_.x; }
@@ -232,22 +530,22 @@ std::vector<Eigen::Vector4d> Target::armor_xyza_list() const
 
   for (int i = 0; i < armor_num_; i++) {
     auto angle = tools::limit_rad(ekf_.x[6] + i * 2 * CV_PI / armor_num_);
-    Eigen::Vector3d xyz = h_armor_xyz(ekf_.x, i);
+    Eigen::Vector3d xyz = h_armor_xyz(ekf_.x, i);//计算出装甲板中心的坐标（考虑长短轴）
     _armor_xyza_list.push_back({xyz[0], xyz[1], xyz[2], angle});
   }
-  return _armor_xyza_list;
-}
+  return _armor_xyza_list;//返回装甲板中心坐标
+}//一辆车的所有装甲板中心坐标
 
 bool Target::diverged() const
 {
-  auto r_ok = ekf_.x[8] > 0.05 && ekf_.x[8] < 0.5;
-  auto l_ok = ekf_.x[8] + ekf_.x[9] > 0.05 && ekf_.x[8] + ekf_.x[9] < 0.5;
+  auto r_ok = ekf_.x[8] > 0.05 && ekf_.x[8] < 0.5;//判断r是否在合理范围内
+  auto l_ok = ekf_.x[8] + ekf_.x[9] > 0.05 && ekf_.x[8] + ekf_.x[9] < 0.5;//l是两组装甲板的半径差值，所以r+l也在合理范围内
 
   if (r_ok && l_ok) return false;
 
   tools::logger()->debug("[Target] r={:.3f}, l={:.3f}", ekf_.x[8], ekf_.x[9]);
   return true;
-}
+}//判断是否发散
 
 bool Target::convergened()
 {
@@ -261,18 +559,18 @@ bool Target::convergened()
   }
 
   return is_converged_;
-}
+}//收敛条件：普通装甲板连续更新3次且不发散，前哨站连续更新10次且不发散
 
 // 计算出装甲板中心的坐标（考虑长短轴）
 Eigen::Vector3d Target::h_armor_xyz(const Eigen::VectorXd & x, int id) const
 {
   auto angle = tools::limit_rad(x[6] + id * 2 * CV_PI / armor_num_);
-  auto use_l_h = (armor_num_ == 4) && (id == 1 || id == 3);
+  auto use_l_h = (armor_num_ == 4) && (id == 1 || id == 3);//当有4个装甲板，id为1或3时，使用长短轴
 
-  auto r = (use_l_h) ? x[8] + x[9] : x[8];
+  auto r = (use_l_h) ? x[8] + x[9] : x[8];//r是装甲板的半径，x[8]是半径，x[9]是半径差值，当有4个装甲板时，使用长短轴，半径为r+l
   auto armor_x = x[0] - r * std::cos(angle);
   auto armor_y = x[2] - r * std::sin(angle);
-  auto armor_z = (use_l_h) ? x[4] + x[10] : x[4];
+  auto armor_z = (use_l_h) ? x[4] + x[10] : x[4];//当有4个装甲板，id为1或3时，使用长短轴，z坐标为z+h
 
   return {armor_x, armor_y, armor_z};
 }
@@ -314,7 +612,7 @@ Eigen::MatrixXd Target::h_jacobian(const Eigen::VectorXd & x, int id) const
   // clang-format on
 
   return H_armor_ypda * H_armor_xyza;
-}
+}//由装甲板中心坐标到观测量的雅可比矩阵H = H_armor_ypda * H_armor_xyza
 
 bool Target::checkinit() { return isinit; }
 

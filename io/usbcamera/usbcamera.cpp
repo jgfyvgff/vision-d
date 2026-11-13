@@ -2,6 +2,7 @@
 
 #include <stdexcept>
 
+#include "io/camera_config.hpp"
 #include "tools/logger.hpp"
 #include "tools/yaml.hpp"
 
@@ -9,6 +10,15 @@ using namespace std::chrono_literals;
 
 namespace io
 {
+namespace
+{
+std::string normalized_device(std::string device)
+{
+  if (device.rfind("/dev/", 0) == 0) device.erase(0, 5);
+  return device;
+}
+}  // namespace
+
 USBCamera::USBCamera(const std::string & open_name, const std::string & config_path)
 : USBCamera(open_name, config_path, "")
 {
@@ -21,10 +31,36 @@ USBCamera::USBCamera(
   auto yaml = tools::load(config_path);
   image_width_ = tools::read<double>(yaml, "image_width");
   image_height_ = tools::read<double>(yaml, "image_height");
-  usb_exposure_ = tools::read<double>(yaml, "usb_exposure");
-  usb_frame_rate_ = tools::read<double>(yaml, "usb_frame_rate");
-  usb_gamma_ = tools::read<double>(yaml, "usb_gamma");
-  usb_gain_ = tools::read<double>(yaml, "usb_gain");
+  const auto cameras = load_camera_configs(config_path);
+  const CameraConfig * selected = nullptr;
+  if (!configured_role_.empty()) {
+    selected = &camera_config_for_role(cameras, configured_role_);
+    if (selected->type != "uvc") {
+      throw std::runtime_error("Camera role '" + configured_role_ + "' is not a UVC camera");
+    }
+  } else {
+    const auto requested_device = normalized_device(open_name_);
+    for (const auto & camera : cameras) {
+      if (camera.type == "uvc" && normalized_device(camera.device) == requested_device) {
+        selected = &camera;
+        configured_role_ = camera.role;
+        break;
+      }
+    }
+  }
+
+  if (selected) {
+    usb_exposure_ = selected->usb_exposure;
+    usb_frame_rate_ = selected->frame_rate_fps;
+    usb_gamma_ = selected->usb_gamma;
+    usb_gain_ = selected->usb_gain;
+  } else {
+    // 兼容尚未迁移到 cameras 列表的旧 UVC 配置。
+    usb_exposure_ = tools::read<double>(yaml, "usb_exposure");
+    usb_frame_rate_ = tools::read<double>(yaml, "usb_frame_rate");
+    usb_gamma_ = tools::read<double>(yaml, "usb_gamma");
+    usb_gain_ = tools::read<double>(yaml, "usb_gain");
+  }
   device_name = configured_role_;
   try_open();
 
@@ -127,7 +163,7 @@ void USBCamera::open()
   cap_.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
   cap_.set(cv::CAP_PROP_FRAME_WIDTH, image_width_);
   cap_.set(cv::CAP_PROP_FRAME_HEIGHT, image_height_);
-  cap_.set(cv::CAP_PROP_FPS, usb_frame_rate_);
+  const bool fps_set = cap_.set(cv::CAP_PROP_FPS, usb_frame_rate_);
   cap_.set(cv::CAP_PROP_AUTO_EXPOSURE, 1);
   cap_.set(cv::CAP_PROP_GAMMA, usb_gamma_);
   cap_.set(cv::CAP_PROP_GAIN, usb_gain_);
@@ -135,7 +171,9 @@ void USBCamera::open()
 
   tools::logger()->info("[{}] {} opened", device_name, true_device_name);
   // tools::logger()->info("USBCamera exposure time:{}", cap_.get(cv::CAP_PROP_EXPOSURE));
-  tools::logger()->info("USBCamera fps:{}", cap_.get(cv::CAP_PROP_FPS));
+  tools::logger()->info(
+    "USBCamera requested fps: {:.1f}, set accepted: {}, driver-reported fps: {:.2f}",
+    usb_frame_rate_, fps_set, cap_.get(cv::CAP_PROP_FPS));
   // tools::logger()->info("USBCamera gamma:{}", cap_.get(cv::CAP_PROP_GAMMA));
 
   // 取图线程
